@@ -1,9 +1,11 @@
 use rand::{rngs::OsRng, Rng, RngCore};
+use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::env;
 use std::f32::consts::PI;
 use std::fs::File;
-use std::io::{stdout, BufWriter, Write};
-use std::collections::VecDeque;
+use std::io::{self, stdout, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -58,17 +60,14 @@ impl Drop for CursorGuard {
 }
 
 struct PadWriter {
-    hex: BufWriter<File>,
     glyphs: BufWriter<File>,
     count: usize,
 }
 
 impl PadWriter {
-    fn new(hex_path: &str, glyph_path: &str) -> std::io::Result<Self> {
-        let hex_file = File::create(hex_path)?;
+    fn new(glyph_path: &str) -> std::io::Result<Self> {
         let glyph_file = File::create(glyph_path)?;
         Ok(Self {
-            hex: BufWriter::new(hex_file),
             glyphs: BufWriter::new(glyph_file),
             count: 0,
         })
@@ -76,11 +75,9 @@ impl PadWriter {
 
     fn push_byte(&mut self, byte: u8) -> std::io::Result<()> {
         let idx = self.count;
-        write!(self.hex, "{:02x}", byte)?;
         write!(self.glyphs, "{}", glyph_from_byte(byte))?;
         self.count += 1;
         if (idx + 1) % 32 == 0 {
-            self.hex.write_all(b"\n")?;
             self.glyphs.write_all(b"\n")?;
         }
         Ok(())
@@ -88,16 +85,13 @@ impl PadWriter {
 
     fn finish(mut self) -> std::io::Result<usize> {
         if self.count % 32 != 0 {
-            self.hex.write_all(b"\n")?;
             self.glyphs.write_all(b"\n")?;
         }
-        self.hex.flush()?;
         self.glyphs.flush()?;
         Ok(self.count)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.hex.flush()?;
         self.glyphs.flush()
     }
 }
@@ -235,13 +229,48 @@ fn glyph_from_byte(byte: u8) -> char {
     char::from_u32(codepoint).unwrap_or('·')
 }
 
+fn byte_from_glyph(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if (0x0100..=0x01FF).contains(&code) {
+        Some((code - 0x0100) as u8)
+    } else {
+        None
+    }
+}
+
 fn print_usage() {
     println!("Usage:");
-    println!("  bytefall                 # Run Bytefall, generating an endless pad to pad.hex");
-    println!("  bytefall -length <n>     # Run Bytefall until it writes n pad bytes to pad.hex/pad.txt");
+    println!("  bytefall                 # Launch the interactive wizard");
+    println!("  bytefall -length <n>     # Run Bytefall pad generation headlessly (no wizard)");
+}
+
+fn generate_pad_headless(mut rng: OsRng, target_len: usize) -> std::io::Result<()> {
+    let mut pad_writer = PadWriter::new("glyph.txt")?;
+    let mut chunk = vec![0u8; 4096];
+    let mut written = 0usize;
+
+    while written < target_len {
+        let remaining = target_len - written;
+        let chunk_size = remaining.min(chunk.len());
+        rng.fill_bytes(&mut chunk[..chunk_size]);
+
+        for byte in &chunk[..chunk_size] {
+            pad_writer.push_byte(*byte)?;
+        }
+
+        written += chunk_size;
+    }
+
+    pad_writer.finish()?;
+    println!("Generated {target_len} bytes to glyph.txt");
+    Ok(())
 }
 
 fn run_animation(mut rng: OsRng, target_len: Option<usize>) -> std::io::Result<()> {
+    if let Some(length) = target_len {
+        return generate_pad_headless(rng, length);
+    }
+
     let mut particles: Vec<Particle> = Vec::new();
     let mut lane_index: usize = 0;
     let lane_count: usize = 24;
@@ -249,7 +278,7 @@ fn run_animation(mut rng: OsRng, target_len: Option<usize>) -> std::io::Result<(
     let swirl_center_y = 6.0;
     let pad_rows: usize = HEIGHT.saturating_sub(2);
     let mut pad_wall = PadWall::new(pad_rows);
-    let mut pad_writer = PadWriter::new("pad.hex", "pad.txt")?;
+    let mut pad_writer = PadWriter::new("glyph.txt")?;
     let mut completion_frames: usize = 0;
 
     let mut stars: Vec<Star> = Vec::new();
@@ -360,41 +389,721 @@ fn run_animation(mut rng: OsRng, target_len: Option<usize>) -> std::io::Result<(
     Ok(())
 }
 
-fn main() {
-    let rng = OsRng;
+struct EncryptionResult {
+    output_path: PathBuf,
+    pad_path: PathBuf,
+}
 
-    let mut args = env::args().skip(1);
-    let mut pad_length: Option<usize> = None;
+struct PadEncryptResult {
+    output_path: PathBuf,
+    start: usize,
+    end: usize,
+}
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-length" | "--length" => {
-                if let Some(val) = args.next() {
-                    match val.parse::<usize>() {
-                        Ok(v) => pad_length = Some(v),
-                        Err(_) => {
-                            eprintln!("Invalid length: {val}");
-                            std::process::exit(1);
+struct PadDecryptResult {
+    output_path: PathBuf,
+}
+
+fn prompt_line(message: &str) -> io::Result<String> {
+    print!("{message}");
+    stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_multiline(message: &str) -> io::Result<String> {
+    println!("{message}");
+    println!("(Enter a blank line to finish.)");
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        let read = io::stdin().read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            break;
+        }
+        lines.push(trimmed.to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn prompt_pad_length() -> io::Result<Option<usize>> {
+    loop {
+        println!("How long do you want the pad to be?");
+        println!("  1) Infinite");
+        println!("  2) Enter a byte length");
+        let choice = prompt_line("> ")?;
+
+        match choice.as_str() {
+            "1" => return Ok(None),
+            "2" => {
+                let length_str = prompt_line("Enter pad length (bytes): ")?;
+                match length_str.parse::<usize>() {
+                    Ok(value) => return Ok(Some(value)),
+                    Err(_) => println!("Please enter a valid number."),
+                }
+            }
+            _ => println!("Please choose 1 or 2."),
+        }
+    }
+}
+
+fn encrypt_file(file_path: &str, rng: &mut OsRng) -> io::Result<EncryptionResult> {
+    let input_path = Path::new(file_path);
+    let mut input = Vec::new();
+    File::open(input_path)?.read_to_end(&mut input)?;
+
+    let mut pad = vec![0u8; input.len()];
+    rng.fill_bytes(&mut pad);
+
+    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bytefall");
+
+    let output_path = parent.join(format!("{stem}.glyph"));
+    let pad_path = parent.join(format!("{stem}.glyphkey.txt"));
+
+    let mut pad_writer = PadWriter::new(pad_path.to_string_lossy().as_ref())?;
+
+    for byte in &pad {
+        pad_writer.push_byte(*byte)?;
+    }
+    pad_writer.finish()?;
+
+    let mut encrypted = Vec::with_capacity(input.len());
+    for (idx, byte) in input.iter().enumerate() {
+        let pad_byte = pad[idx];
+        encrypted.push(byte ^ pad_byte);
+    }
+
+    File::create(&output_path)?.write_all(&encrypted)?;
+
+    Ok(EncryptionResult {
+        output_path,
+        pad_path,
+    })
+}
+
+fn read_pad(path: &str) -> io::Result<Vec<u8>> {
+    let mut contents = String::new();
+    File::open(path)?.read_to_string(&mut contents)?;
+    let mut pad = Vec::new();
+    for ch in contents.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if let Some(byte) = byte_from_glyph(ch) {
+            pad.push(byte);
+        }
+    }
+    Ok(pad)
+}
+
+fn read_pad_index_path(pad_path: &Path) -> PathBuf {
+    let mut idx = pad_path.to_path_buf();
+    let new_ext = match pad_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.idx"),
+        None => "idx".to_string(),
+    };
+    idx.set_extension(new_ext);
+    idx
+}
+
+fn load_pad_index(pad_path: &Path) -> io::Result<usize> {
+    let idx_path = read_pad_index_path(pad_path);
+    if let Ok(mut file) = File::open(&idx_path) {
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        if buf.trim().is_empty() {
+            return Ok(0);
+        }
+        match buf.trim().parse::<usize>() {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(0),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+fn save_pad_index(pad_path: &Path, value: usize) -> io::Result<()> {
+    let idx_path = read_pad_index_path(pad_path);
+    File::create(idx_path)?.write_all(value.to_string().as_bytes())
+}
+
+fn read_pad_slice(path: &str, start: usize, end: usize) -> io::Result<Vec<u8>> {
+    let pad = read_pad(path)?;
+    if end > pad.len() || start > end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Pad range is out of bounds",
+        ));
+    }
+    Ok(pad[start..end].to_vec())
+}
+
+fn resolve_glyph_pad_path(prompt: &str) -> io::Result<String> {
+    let default = Path::new("glyph.txt");
+    if default.exists() {
+        return Ok(String::from("glyph.txt"));
+    }
+
+    loop {
+        let path = prompt_line(prompt)?;
+        if path.is_empty() {
+            println!("Please enter a valid pad path.");
+            continue;
+        }
+        return Ok(path);
+    }
+}
+
+fn resolve_glyph_key_path(enc_path: &str, prompt: &str) -> io::Result<String> {
+    let enc_path = Path::new(enc_path);
+    let parent = enc_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = enc_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bytefall");
+    let candidate = parent.join(format!("{stem}.glyphkey.txt"));
+    if candidate.exists() {
+        return Ok(candidate.to_string_lossy().to_string());
+    }
+
+    loop {
+        let path = prompt_line(prompt)?;
+        if path.is_empty() {
+            println!("Please enter a valid key path.");
+            continue;
+        }
+        return Ok(path);
+    }
+}
+
+fn decrypt_file(enc_path: &str, pad_path: &str) -> io::Result<PathBuf> {
+    let input_path = Path::new(enc_path);
+    let mut input = Vec::new();
+    File::open(input_path)?.read_to_end(&mut input)?;
+
+    let pad = read_pad(pad_path)?;
+    if pad.len() != input.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Pad length does not match encrypted file length",
+        ));
+    }
+
+    let mut decrypted = Vec::with_capacity(input.len());
+    for (idx, byte) in input.iter().enumerate() {
+        decrypted.push(byte ^ pad[idx]);
+    }
+
+    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bytefall");
+    let output_path = parent.join(format!("{stem}.dec"));
+    File::create(&output_path)?.write_all(&decrypted)?;
+    Ok(output_path)
+}
+
+const PAD_HEADER_PREFIX: &str = "BYTEFALL-PAD-OFFSET:";
+const PAD_HASH_MARKER: &str = "HASH:";
+const PAD_HASH_LEN: usize = 32; // SHA-256 output bytes
+
+fn parse_pad_header(line: &str) -> io::Result<(usize, usize)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(PAD_HEADER_PREFIX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Missing pad offset header",
+        ));
+    }
+    let rest = trimmed[PAD_HEADER_PREFIX.len()..].trim();
+    let mut parts = rest.split('-');
+    let start = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing start offset"))?
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid start offset"))?;
+    let end = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing end offset"))?
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid end offset"))?;
+    if start >= end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Pad header has invalid range",
+        ));
+    }
+    Ok((start, end))
+}
+
+fn parse_hash_line(line: &str) -> io::Result<Option<Vec<u8>>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.starts_with(PAD_HASH_MARKER) {
+        return Ok(None);
+    }
+    let hex = trimmed[PAD_HASH_MARKER.len()..].trim();
+    if hex.len() != PAD_HASH_LEN * 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid hash length",
+        ));
+    }
+    let mut out = Vec::with_capacity(PAD_HASH_LEN);
+    for i in 0..PAD_HASH_LEN {
+        let idx = i * 2;
+        let byte = u8::from_str_radix(&hex[idx..idx + 2], 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid hash hex"))?;
+        out.push(byte);
+    }
+    Ok(Some(out))
+}
+
+fn const_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn glyphs_to_bytes(input: &str) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for ch in input.chars() {
+        if ch == '\n' || ch == '\r' || ch.is_whitespace() {
+            continue;
+        }
+        if let Some(byte) = byte_from_glyph(ch) {
+            out.push(byte);
+        }
+    }
+    Ok(out)
+}
+
+fn bytes_to_glyph_lines(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (idx, byte) in bytes.iter().enumerate() {
+        out.push(glyph_from_byte(*byte));
+        if (idx + 1) % 64 == 0 {
+            out.push('\n');
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn pad_balance(pad_path: &str) -> io::Result<(usize, usize)> {
+    let total = read_pad(pad_path)?.len();
+    let used = load_pad_index(Path::new(pad_path))?;
+    if used > total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Pad index exceeds pad length",
+        ));
+    }
+    Ok((used, total))
+}
+
+fn pad_encrypt(file_path: &str, pad_path: &str) -> io::Result<PadEncryptResult> {
+    let input_path = Path::new(file_path);
+    let mut input = Vec::new();
+    File::open(input_path)?.read_to_end(&mut input)?;
+
+    let start = load_pad_index(Path::new(pad_path))?;
+    let cipher_end = start + input.len();
+    let hash_key_start = cipher_end;
+    let hash_key_end = hash_key_start + PAD_HASH_LEN;
+    let pad_slice = read_pad_slice(pad_path, start, cipher_end)?;
+    let hash_key = read_pad_slice(pad_path, hash_key_start, hash_key_end)?;
+
+    let mut encrypted = Vec::with_capacity(input.len());
+    for (idx, byte) in input.iter().enumerate() {
+        encrypted.push(byte ^ pad_slice[idx]);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&encrypted);
+    let hash = hasher.finalize();
+    let mut hash_encrypted = Vec::with_capacity(PAD_HASH_LEN);
+    for (idx, byte) in hash.as_slice().iter().enumerate() {
+        hash_encrypted.push(byte ^ hash_key[idx]);
+    }
+
+    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bytefall");
+    let output_path = parent.join(format!("{stem}.glyphs"));
+
+    let mut file = File::create(&output_path)?;
+    let header = format!("{PAD_HEADER_PREFIX} {start}-{cipher_end}\n{PAD_HASH_MARKER} ");
+    file.write_all(header.as_bytes())?;
+    for byte in &hash_encrypted {
+        write!(file, "{:02x}", byte)?;
+    }
+    file.write_all(b"\n")?;
+    file.write_all(&encrypted)?;
+
+    save_pad_index(Path::new(pad_path), hash_key_end)?;
+
+    Ok(PadEncryptResult {
+        output_path,
+        start,
+        end: hash_key_end,
+    })
+}
+
+fn pad_decrypt(enc_path: &str, pad_path: &str) -> io::Result<PadDecryptResult> {
+    let input_path = Path::new(enc_path);
+    let mut reader = BufReader::new(File::open(input_path)?);
+    let mut header_line = String::new();
+    reader.read_line(&mut header_line)?;
+    let (start, end) = parse_pad_header(&header_line)?;
+
+    let mut second_line = String::new();
+    let _ = reader.read_line(&mut second_line)?;
+    let hash_encrypted = parse_hash_line(&second_line)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing encrypted hash line"))?;
+
+    let mut ciphertext = Vec::new();
+    reader.read_to_end(&mut ciphertext)?;
+
+    if ciphertext.len() != end.saturating_sub(start) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Ciphertext length does not match pad range",
+        ));
+    }
+
+    let pad_slice = read_pad_slice(pad_path, start, end)?;
+    let hash_key = read_pad_slice(pad_path, end, end + PAD_HASH_LEN)?;
+    let mut decrypted = Vec::with_capacity(ciphertext.len());
+    for (idx, byte) in ciphertext.iter().enumerate() {
+        decrypted.push(byte ^ pad_slice[idx]);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&ciphertext);
+    let hash = hasher.finalize();
+    let mut hash_decrypted = Vec::with_capacity(PAD_HASH_LEN);
+    for (idx, byte) in hash_encrypted.iter().enumerate() {
+        hash_decrypted.push(byte ^ hash_key[idx]);
+    }
+    if !const_time_eq(hash.as_slice(), &hash_decrypted) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hash verification failed",
+        ));
+    }
+
+    let current_idx = load_pad_index(Path::new(pad_path))?;
+    let next_idx = current_idx.max(end + PAD_HASH_LEN);
+    save_pad_index(Path::new(pad_path), next_idx)?;
+
+    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bytefall");
+    let output_path = parent.join(format!("{stem}.glyphs.dec"));
+    File::create(&output_path)?.write_all(&decrypted)?;
+
+    Ok(PadDecryptResult { output_path })
+}
+
+fn pad_message_encrypt(pad_path: &str, plaintext: &str) -> io::Result<(String, usize, usize)> {
+    let bytes = plaintext.as_bytes();
+    let start = load_pad_index(Path::new(pad_path))?;
+    let end = start + bytes.len();
+
+    let pad_slice = read_pad_slice(pad_path, start, end)?;
+
+    let mut ciphertext = Vec::with_capacity(bytes.len());
+    for (idx, byte) in bytes.iter().enumerate() {
+        ciphertext.push(byte ^ pad_slice[idx]);
+    }
+
+    let mut out = String::new();
+    let header = format!("{PAD_HEADER_PREFIX} {start}-{end}\n");
+    out.push_str(&header);
+    out.push_str(&bytes_to_glyph_lines(&ciphertext));
+
+    save_pad_index(Path::new(pad_path), end)?;
+
+    Ok((out, start, end))
+}
+
+fn pad_message_decrypt(pad_path: &str, message: &str) -> io::Result<(String, usize, usize)> {
+    let mut lines = message.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing header line"))?;
+    let (start, end) = parse_pad_header(header_line)?;
+
+    let mut ciphertext_glyphs = String::new();
+    for line in lines {
+        ciphertext_glyphs.push_str(line);
+        ciphertext_glyphs.push('\n');
+    }
+
+    let ciphertext = glyphs_to_bytes(&ciphertext_glyphs)?;
+    if ciphertext.len() != end.saturating_sub(start) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Ciphertext length does not match pad range",
+        ));
+    }
+
+    let pad_slice = read_pad_slice(pad_path, start, end)?;
+
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    for (idx, byte) in ciphertext.iter().enumerate() {
+        plaintext.push(byte ^ pad_slice[idx]);
+    }
+
+    let current_idx = load_pad_index(Path::new(pad_path))?;
+    let next_idx = current_idx.max(end);
+    save_pad_index(Path::new(pad_path), next_idx)?;
+
+    let plaintext_str = String::from_utf8(plaintext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Message is not valid UTF-8"))?;
+
+    Ok((plaintext_str, start, end))
+}
+
+fn run_wizard() -> io::Result<()> {
+    println!("Welcome to Bytefall!");
+    println!("How can I help you?");
+    println!("  1) Generate glyph");
+    println!("  2) Quick encrypt");
+    println!("  3) Quick decrypt");
+    println!("  4) Glyph encrypt");
+    println!("  5) Glyph decrypt");
+    println!("  6) Glyph message");
+    println!("  7) Glyph balance");
+
+    loop {
+        let choice = prompt_line("> ")?;
+
+        match choice.as_str() {
+            "1" => {
+                let pad_length = prompt_pad_length()?;
+                return run_animation(OsRng, pad_length);
+            }
+            "2" => {
+                let file_path = prompt_line("Enter the path to the file: ")?;
+                if file_path.is_empty() {
+                    println!("Please enter a valid file path.");
+                    continue;
+                }
+
+                let mut rng = OsRng;
+                let result = encrypt_file(&file_path, &mut rng)?;
+
+                println!("Encryption complete.");
+                println!("Encrypted file: {}", result.output_path.display());
+                println!("Glyph key: {}", result.pad_path.display());
+                return Ok(());
+            }
+            "3" => {
+                let enc_path = prompt_line("Enter the path to the glyph-encrypted file: ")?;
+                if enc_path.is_empty() {
+                    println!("Please enter a valid file path.");
+                    continue;
+                }
+                let pad_path =
+                    resolve_glyph_key_path(&enc_path, "Enter the path to the glyph key: ")?;
+
+                match decrypt_file(&enc_path, &pad_path) {
+                    Ok(output_path) => {
+                        println!("Decryption complete.");
+                        println!("Decrypted file: {}", output_path.display());
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Decryption failed: {err}");
+                    }
+                }
+            }
+            "4" => {
+                let pad_path = resolve_glyph_pad_path("Enter the path to glyph.txt: ")?;
+                let file_path = prompt_line("Enter the path to the file to encrypt: ")?;
+                if file_path.is_empty() {
+                    println!("Please enter a valid file path.");
+                    continue;
+                }
+
+                match pad_encrypt(&file_path, &pad_path) {
+                    Ok(result) => {
+                        println!("Pad encryption complete.");
+                        println!("Encrypted file: {}", result.output_path.display());
+                        println!(
+                            "Pad bytes used: {}-{} (start-end, end exclusive)",
+                            result.start, result.end
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Pad encryption failed: {err}");
+                    }
+                }
+            }
+            "5" => {
+                let enc_path = prompt_line("Enter the path to the .glyphs encrypted file: ")?;
+                if enc_path.is_empty() {
+                    println!("Please enter a valid file path.");
+                    continue;
+                }
+                let pad_path = resolve_glyph_pad_path("Enter the path to glyph.txt: ")?;
+
+                match pad_decrypt(&enc_path, &pad_path) {
+                    Ok(result) => {
+                        println!("Pad decryption complete.");
+                        println!("Decrypted file: {}", result.output_path.display());
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Pad decryption failed: {err}");
+                    }
+                }
+            }
+            "6" => {
+                let pad_path = resolve_glyph_pad_path("Enter the path to glyph.txt: ")?;
+                let mode = prompt_line("Encrypt or decrypt? (e/d): ")?;
+
+                match mode.to_lowercase().as_str() {
+                    "e" => {
+                        let plaintext = prompt_multiline(
+                            "Enter the message to encrypt (glyph output will follow):",
+                        )?;
+                        if plaintext.is_empty() {
+                            println!("Message cannot be empty.");
+                            continue;
+                        }
+
+                        match pad_message_encrypt(&pad_path, &plaintext) {
+                            Ok((message, start, end)) => {
+                                println!(
+                                    "Pad bytes used: {}-{} (start-end, end exclusive)",
+                                    start, end
+                                );
+                                println!("Encrypted message (copy/paste below):");
+                                println!("{}", message);
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                println!("Message encryption failed: {err}");
+                            }
                         }
                     }
-                } else {
-                    eprintln!("Missing value for -length");
+                    "d" => {
+                        let pasted = prompt_multiline(
+                            "Paste the encrypted glyph message (including headers) and leave a blank line to finish:",
+                        )?;
+                        if pasted.is_empty() {
+                            println!("Message cannot be empty.");
+                            continue;
+                        }
+
+                        match pad_message_decrypt(&pad_path, &pasted) {
+                            Ok((plaintext, start, end)) => {
+                                println!(
+                                    "Pad bytes consumed: {}-{} (start-end, end exclusive)",
+                                    start, end
+                                );
+                                println!("Decrypted message:");
+                                println!("{}", plaintext);
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                println!("Message decryption failed: {err}");
+                            }
+                        }
+                    }
+                    _ => {
+                        println!("Please choose 'e' for encrypt or 'd' for decrypt.");
+                    }
+                }
+            }
+            "7" => {
+                let pad_path = resolve_glyph_pad_path("Enter the path to glyph.txt: ")?;
+                match pad_balance(&pad_path) {
+                    Ok((used, total)) => {
+                        let remaining = total.saturating_sub(used);
+                        println!("Pad total bytes: {total}");
+                        println!("Pad used bytes: {used}");
+                        println!("Pad remaining bytes: {remaining}");
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Unable to read pad balance: {err}");
+                    }
+                }
+            }
+            _ => println!("Please choose 1, 2, 3, 4, 5, 6, or 7."),
+        }
+    }
+}
+
+fn main() {
+    let mut args = env::args().skip(1).peekable();
+
+    let result = if args.peek().is_none() {
+        run_wizard()
+    } else {
+        let mut pad_length: Option<usize> = None;
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-length" | "--length" => {
+                    if let Some(val) = args.next() {
+                        match val.parse::<usize>() {
+                            Ok(v) => pad_length = Some(v),
+                            Err(_) => {
+                                eprintln!("Invalid length: {val}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("Missing value for -length");
+                        std::process::exit(1);
+                    }
+                }
+                "-h" | "--help" => {
+                    print_usage();
+                    return;
+                }
+                other => {
+                    eprintln!("Unknown argument: {other}");
+                    print_usage();
                     std::process::exit(1);
                 }
             }
-            "-h" | "--help" => {
-                print_usage();
-                return;
-            }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                print_usage();
-                std::process::exit(1);
-            }
         }
-    }
 
-    if let Err(err) = run_animation(rng, pad_length) {
+        run_animation(OsRng, pad_length)
+    };
+
+    if let Err(err) = result {
         eprintln!("Bytefall error: {err}");
     }
 }

@@ -1,10 +1,11 @@
 [package]
-name = "nine"
+name = "hieroglyph"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 rand = "0.8"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3
