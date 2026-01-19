@@ -1,2 +1,9 @@
 #Rust build output
 target/
+glyph.txt
+*.glyph
+*.glyphkey.txt
+*.glyphs
+*.glyphs.dec
+*.dec
+*.idx
