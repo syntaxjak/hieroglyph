@@ -9,13 +9,13 @@ cargo run --release                  # launch the wizard (generate a pad or encr
 cargo run --release -- -length 1024  # skip the wizard and stop after writing 1024 pad bytes
 ```
 
-The generated pad is written to `glyph.txt` as the visible byte glyphs you see in the animation (32 glyphs per line).
+The generated pad is written to `pad.bin` as raw bytes (the animation still shows glyphs, but the file itself is binary-safe).
 
 Wizard options:
-- **Generate glyphs:** Runs the falling animation and writes `glyph.txt` (optionally capped with `-length`).
-- **Encrypt file:** Uses XOR with a one-time pad the exact length of your file. The encrypted data is written to `<name>.glyph` and the pad is stored as `<name>.glyphkey.txt` (glyphs only).
-- **Decrypt file:** Provide the encrypted file and its matching `<name>.glyphkey.txt` to recover the original bytes into `<name>.dec`.
-- **Glyph pad encrypt:** Use an existing glyph pad (`glyph.txt`) as a shared one-time pad. The tool takes the next unused bytes (tracked in a `.idx` file next to the pad), encrypts your file to `<name>.glyphs`, stamps a header noting the byte range used, and appends an encrypted SHA-256 hash for tamper detection (consumes an extra 32 pad bytes per file).
-- **Glyph pad decrypt:** Given a glyph-pad-encrypted file and the shared pad, it reads the header to grab the right byte range, verifies the encrypted hash, XORs, and outputs `<name>.glyphs.dec`. The `.idx` file is advanced to avoid reusing pad bytes.
+- **Generate pad:** Runs the falling animation and writes `pad.bin` (optionally capped with `-length`).
+- **Encrypt file:** Uses XOR with a one-time pad the exact length of your file. The encrypted data is written to `<name>.glyph` and the pad is stored as `<name>.glyphkey.bin` (binary).
+- **Decrypt file:** Provide the encrypted file and its matching `<name>.glyphkey.bin` to recover the original bytes into `<name>.dec`.
+- **Pad encrypt:** Use an existing shared pad (`pad.bin`) as a one-time pad. The tool takes the next unused bytes (tracked in a `.idx` file next to the pad), encrypts your file to `<name>.glyphs`, stamps a header noting the byte range used, and appends an encrypted SHA-256 hash for tamper detection (consumes an extra 32 pad bytes per file).
+- **Pad decrypt:** Given a pad-encrypted file and the shared pad, it reads the header to grab the right byte range, verifies the encrypted hash, XORs, and outputs `<name>.glyphs.dec`. The `.idx` file is advanced to avoid reusing pad bytes.
 
 Use `Ctrl+C` to stop early if you do not want to watch the full loop.
