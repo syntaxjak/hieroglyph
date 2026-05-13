@@ -7,6 +7,8 @@ edition = "2021"
 rand = "0.8"
 sha2 = "0.10"
 fs2 = "0.4"
+ratatui = "0.28"
+crossterm = "0.27"
 
 [profile.release]
 opt-level = 3

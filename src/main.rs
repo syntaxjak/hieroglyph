@@ -1,222 +1,50 @@
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fs2::FileExt;
-use rand::{rngs::OsRng, Rng, RngCore};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::env;
-use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
-use std::io::{self, stdout, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::thread::sleep;
-use std::time::Duration;
-
-const WIDTH: usize = 80;
-const HEIGHT: usize = 24;
-const RESET: &str = "\x1b[0m";
-const COLOR_TITLE: &str = "\x1b[38;5;120m";
-const COLOR_AURA: &str = "\x1b[38;5;135m";
-const COLOR_DIM_STAR: &str = "\x1b[38;5;240m";
-const COLOR_BRIGHT_STAR: &str = "\x1b[38;5;45m";
-const NUMBER_COLORS: [&str; 6] = [
-    "\x1b[38;5;51m",
-    "\x1b[38;5;81m",
-    "\x1b[38;5;159m",
-    "\x1b[38;5;219m",
-    "\x1b[38;5;214m",
-    "\x1b[38;5;190m",
-];
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use ratatui::text::{Line, Span};
 
 const DEFAULT_PAD_PATH: &str = "pad.bin";
-
-#[derive(Clone, Copy)]
-struct Cell {
-    ch: char,
-    color: Option<&'static str>,
-}
-
-#[derive(Clone)]
-struct Particle {
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-    life: f32,
-    symbol: char,
-    color: &'static str,
-}
-
-#[derive(Clone)]
-struct Star {
-    x: usize,
-    y: usize,
-    speed: f32,
-    offset: f32,
-}
-
-struct CursorGuard;
-
-impl Drop for CursorGuard {
-    fn drop(&mut self) {
-        print!("\x1b[?25h");
-        let _ = stdout().flush();
-    }
-}
+const GLYPH_ENCRYPTED_EXT: &str = "glyph";
+const PAD_ENCRYPTED_EXT: &str = "glyphs";
+const MESSAGE_PAD_PATH: &str = "message_pad.txt";
 
 struct PadWriter {
     writer: BufWriter<File>,
-    count: usize,
+    pub count: usize,
 }
 
 impl PadWriter {
-    fn new(glyph_path: &str) -> std::io::Result<Self> {
-        let glyph_file = File::create(glyph_path)?;
+    fn new(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+
         Ok(Self {
-            writer: BufWriter::new(glyph_file),
+            writer: BufWriter::new(file),
             count: 0,
         })
     }
 
-    fn push_byte(&mut self, byte: u8) -> std::io::Result<()> {
+    fn push_byte(&mut self, byte: u8) -> io::Result<()> {
         self.writer.write_all(&[byte])?;
         self.count += 1;
         Ok(())
     }
 
-    fn finish(mut self) -> std::io::Result<usize> {
+    fn finish(&mut self) -> io::Result<()> {
         self.writer.flush()?;
-        Ok(self.count)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-struct PadWall {
-    rows: VecDeque<Vec<u8>>,
-    max_rows: usize,
-}
-
-impl PadWall {
-    fn new(max_rows: usize) -> Self {
-        Self {
-            rows: VecDeque::new(),
-            max_rows,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.rows.back().map(|r| r.len() >= WIDTH).unwrap_or(true) {
-            self.rows.push_back(Vec::new());
-        }
-        if let Some(last) = self.rows.back_mut() {
-            last.push(byte);
-        }
-        while self.rows.len() > self.max_rows {
-            self.rows.pop_front();
-        }
-    }
-
-    fn render(&self, buffer: &mut [Cell]) {
-        let rows_available = self.rows.len();
-        let pad_rows = self.max_rows.min(HEIGHT.saturating_sub(2));
-        let offset = pad_rows.saturating_sub(rows_available);
-
-        for row in 0..pad_rows {
-            let y = (HEIGHT - pad_rows) as isize + row as isize;
-            if row < offset {
-                continue;
-            }
-            let src_row = row - offset;
-            if let Some(data) = self.rows.get(src_row) {
-                for (col, byte) in data.iter().enumerate() {
-                    let glyph = glyph_from_byte(*byte);
-                    let color = NUMBER_COLORS[(*byte as usize) % NUMBER_COLORS.len()];
-                    set_cell(buffer, col as isize, y, glyph, Some(color));
-                }
-            }
-        }
-    }
-}
-
-fn set_cell(buffer: &mut [Cell], x: isize, y: isize, ch: char, color: Option<&'static str>) {
-    if x < 0 || y < 0 {
-        return;
-    }
-
-    let tx = x as usize;
-    let ty = y as usize;
-    if tx < WIDTH && ty < HEIGHT {
-        buffer[ty * WIDTH + tx] = Cell { ch, color };
-    }
-}
-
-fn render_frame(buffer: &[Cell]) {
-    let mut out = String::with_capacity(WIDTH * HEIGHT * 4 + HEIGHT);
-    let mut current_color: Option<&'static str> = None;
-
-    for row in 0..HEIGHT {
-        let start = row * WIDTH;
-        let end = start + WIDTH;
-
-        for cell in &buffer[start..end] {
-            if cell.color != current_color {
-                match cell.color {
-                    Some(color) => out.push_str(color),
-                    None => out.push_str(RESET),
-                }
-
-                current_color = cell.color;
-            }
-
-            out.push(cell.ch);
-        }
-
-        if current_color.is_some() {
-            out.push_str(RESET);
-            current_color = None;
-        }
-
-        out.push('\n');
-    }
-
-    print!("\x1b[2J\x1b[H{}", out);
-    let _ = stdout().flush();
-}
-
-fn draw_starfield(buffer: &mut [Cell], stars: &[Star], frame: usize) {
-    for star in stars {
-        let phase = ((frame as f32) * star.speed + star.offset).sin() * 0.5 + 0.5;
-        let (ch, color) = if phase > 0.8 {
-            ('✦', Some(COLOR_BRIGHT_STAR))
-        } else if phase > 0.45 {
-            ('*', Some(COLOR_DIM_STAR))
-        } else {
-            ('·', Some(COLOR_DIM_STAR))
-        };
-
-        set_cell(buffer, star.x as isize, star.y as isize, ch, color);
-    }
-}
-
-fn draw_swirl(buffer: &mut [Cell], center_x: f32, center_y: f32, frame: usize) {
-    let ring_points = 14;
-    let base_angle = frame as f32 * 0.18;
-
-    for i in 0..ring_points {
-        let angle = base_angle + i as f32 * (2.0 * PI / ring_points as f32);
-        let radius = 2.6 + ((frame as f32) * 0.08 + i as f32 * 0.35).sin() * 0.5;
-        let px = center_x + angle.cos() * radius;
-        let py = center_y + angle.sin() * (radius * 0.6) - 0.4;
-        let ch = if (frame + i) % 3 == 0 { '°' } else { '·' };
-
-        set_cell(
-            buffer,
-            px.round() as isize,
-            py.round() as isize,
-            ch,
-            Some(COLOR_AURA),
-        );
+        self.writer.get_ref().sync_all()?;
+        Ok(())
     }
 }
 
@@ -263,125 +91,61 @@ fn generate_pad_headless(mut rng: OsRng, target_len: usize) -> std::io::Result<(
 }
 
 fn run_animation(mut rng: OsRng, target_len: Option<usize>) -> std::io::Result<()> {
-    if let Some(length) = target_len {
-        return generate_pad_headless(rng, length);
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
+    if target_len.is_none() {
+        return generate_pad_headless(rng, 1024 * 1024);
     }
 
-    let mut particles: Vec<Particle> = Vec::new();
-    let mut lane_index: usize = 0;
-    let lane_count: usize = 24;
-    let stream_center_x = WIDTH as f32 / 2.0;
-    let swirl_center_y = 6.0;
-    let pad_rows: usize = HEIGHT.saturating_sub(2);
-    let mut pad_wall = PadWall::new(pad_rows);
+    let target_len = target_len.unwrap_or(0);
+    let mut terminal = ratatui::init();
     let mut pad_writer = PadWriter::new(DEFAULT_PAD_PATH)?;
-    let mut completion_frames: usize = 0;
+    let mut chunk = vec![0u8; 4096];
+    let mut recent = VecDeque::<u8>::new();
 
-    let mut stars: Vec<Star> = Vec::new();
-    for _ in 0..55 {
-        let x = (rng.next_u32() as usize) % WIDTH;
-        let y = (rng.next_u32() as usize) % (HEIGHT.saturating_sub(6).max(1));
-        stars.push(Star {
-            x,
-            y,
-            speed: rng.gen_range(0.02..0.06),
-            offset: rng.gen_range(0.0..(2.0 * PI)),
-        });
-    }
-
-    let _cursor = CursorGuard;
-    println!("\x1b[?25l");
-
-    let mut frame: usize = 0;
-    loop {
-        let pad_full = target_len.map(|t| pad_writer.count >= t).unwrap_or(false);
-
-        if particles.len() < 48 && !pad_full {
-            let lane_offset = (lane_index as f32) - (lane_count as f32 / 2.0) + 0.5;
-            lane_index = (lane_index + 1) % lane_count;
-
-            let byte = rng.next_u32() as u8;
-            let symbol = glyph_from_byte(byte);
-            let color = NUMBER_COLORS[(byte as usize) % NUMBER_COLORS.len()];
-            let spawn_x = stream_center_x + lane_offset * 1.4 + rng.gen_range(-0.3..0.3);
-            let spawn_y = 1.0;
-            let vx = rng.gen_range(-0.08..0.08);
-            let vy = rng.gen_range(0.35..0.95);
-
-            pad_writer.push_byte(byte)?;
-            pad_wall.push(byte);
-
-            particles.push(Particle {
-                x: spawn_x,
-                y: spawn_y,
-                vx,
-                vy,
-                life: rng.gen_range(2.4..3.4),
-                symbol,
-                color,
-            });
-        }
-
-        if pad_full {
-            completion_frames += 1;
-            if completion_frames > 90 {
-                pad_writer.finish()?;
-                break;
+    while pad_writer.count < target_len {
+        let remaining = target_len - pad_writer.count;
+        let chunk_size = remaining.min(chunk.len());
+        rng.fill_bytes(&mut chunk[..chunk_size]);
+        for byte in &chunk[..chunk_size] {
+            pad_writer.push_byte(*byte)?;
+            recent.push_back(*byte);
+            if recent.len() > 64 {
+                recent.pop_front();
             }
         }
 
-        for p in &mut particles {
-            p.x += p.vx;
-            p.y += p.vy;
-            p.vx *= 0.995;
-            p.vy += 0.018;
-            p.life -= 0.02;
-        }
+        let done = pad_writer.count;
+        terminal.draw(|f| {
+            let area = f.area();
+            let vertical = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(5),
+            ])
+            .split(area);
 
-        particles.retain(|p| p.life > 0.0 && p.y > 0.0 && p.y < HEIGHT as f32 + 2.0);
+            let title = Paragraph::new("Hieroglyph - Pad Generation")
+                .block(Block::bordered().title("Status"));
+            f.render_widget(title, vertical[0]);
 
-        let mut buffer = vec![
-            Cell {
-                ch: ' ',
-                color: None,
-            };
-            WIDTH * HEIGHT
-        ];
+            let gauge = Gauge::default()
+                .block(Block::bordered().title("Progress"))
+                .ratio(done as f64 / target_len as f64)
+                .label(format!("{done}/{target_len} bytes"));
+            f.render_widget(gauge, vertical[1]);
 
-        draw_starfield(&mut buffer, &stars, frame);
-        draw_swirl(&mut buffer, stream_center_x, swirl_center_y, frame);
-
-        for p in &particles {
-            let px = p.x.round() as isize;
-            let py = p.y.round() as isize;
-            let glyph = if p.life < 0.25 { '·' } else { p.symbol };
-            set_cell(&mut buffer, px, py, glyph, Some(p.color));
-        }
-
-        pad_wall.render(&mut buffer);
-
-        let title = if let Some(t) = target_len {
-            format!("  NINE - Bytefall ({}/{})  ", pad_writer.count.min(t), t)
-        } else {
-            format!("  NINE - Bytefall ({})  ", pad_writer.count)
-        };
-        let start = (WIDTH.saturating_sub(title.len())) / 2;
-        for (idx, ch) in title.chars().enumerate() {
-            set_cell(
-                &mut buffer,
-                (idx + start) as isize,
-                0,
-                ch,
-                Some(COLOR_TITLE),
-            );
-        }
-
-        render_frame(&buffer);
-        pad_writer.flush()?;
-        sleep(Duration::from_millis(55));
-        frame = frame.wrapping_add(1);
+            let glyphs: String = recent.iter().map(|b| glyph_from_byte(*b)).collect();
+            let preview = Paragraph::new(glyphs)
+                .block(Block::bordered().title("Recent glyph stream"));
+            f.render_widget(preview, vertical[2]);
+        })?;
     }
 
+    pad_writer.finish()?;
+    ratatui::restore();
+    println!("Generated {target_len} bytes to {}", DEFAULT_PAD_PATH);
     Ok(())
 }
 
@@ -398,54 +162,6 @@ struct PadEncryptResult {
 
 struct PadDecryptResult {
     output_path: PathBuf,
-}
-
-fn prompt_line(message: &str) -> io::Result<String> {
-    print!("{message}");
-    stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
-}
-
-fn prompt_multiline(message: &str) -> io::Result<String> {
-    println!("{message}");
-    println!("(Enter a blank line to finish.)");
-    let mut lines = Vec::new();
-    loop {
-        let mut line = String::new();
-        let read = io::stdin().read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed.is_empty() {
-            break;
-        }
-        lines.push(trimmed.to_string());
-    }
-    Ok(lines.join("\n"))
-}
-
-fn prompt_pad_length() -> io::Result<Option<usize>> {
-    loop {
-        println!("How long do you want the pad to be?");
-        println!("  1) Infinite");
-        println!("  2) Enter a byte length");
-        let choice = prompt_line("> ")?;
-
-        match choice.as_str() {
-            "1" => return Ok(None),
-            "2" => {
-                let length_str = prompt_line("Enter pad length (bytes): ")?;
-                match length_str.parse::<usize>() {
-                    Ok(value) => return Ok(Some(value)),
-                    Err(_) => println!("Please enter a valid number."),
-                }
-            }
-            _ => println!("Please choose 1 or 2."),
-        }
-    }
 }
 
 fn encrypt_file(file_path: &str, rng: &mut OsRng) -> io::Result<EncryptionResult> {
@@ -576,42 +292,42 @@ fn pad_length_bytes(path: &str) -> io::Result<usize> {
     })
 }
 
-fn resolve_glyph_pad_path(prompt: &str) -> io::Result<String> {
-    let default = Path::new(DEFAULT_PAD_PATH);
-    if default.exists() {
-        return Ok(String::from(DEFAULT_PAD_PATH));
-    }
-
-    loop {
-        let path = prompt_line(prompt)?;
-        if path.is_empty() {
-            println!("Please enter a valid pad path.");
-            continue;
+fn list_files_with_extension(ext: &str) -> io::Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(env::current_dir()?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some(ext) {
+            matches.push(path.to_string_lossy().to_string());
         }
-        return Ok(path);
     }
+    matches.sort();
+    Ok(matches)
 }
 
-fn resolve_glyph_key_path(enc_path: &str, prompt: &str) -> io::Result<String> {
-    let enc_path = Path::new(enc_path);
-    let parent = enc_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = enc_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("bytefall");
-    let candidate = parent.join(format!("{stem}.glyphkey.bin"));
-    if candidate.exists() {
-        return Ok(candidate.to_string_lossy().to_string());
-    }
-
-    loop {
-        let path = prompt_line(prompt)?;
-        if path.is_empty() {
-            println!("Please enter a valid key path.");
+fn detect_encryptable_files() -> io::Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(env::current_dir()?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
             continue;
         }
-        return Ok(path);
+        matches.push(path.to_string_lossy().to_string());
     }
+    matches.sort();
+    Ok(matches)
+}
+
+fn auto_glyph_key_path(enc_path: &str) -> Option<String> {
+    let enc_path = Path::new(enc_path);
+    let parent = enc_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = enc_path.file_stem()?.to_string_lossy();
+    let candidate = parent.join(format!("{stem}.glyphkey.bin"));
+    if candidate.exists() {
+        return Some(candidate.to_string_lossy().to_string());
+    }
+    None
 }
 
 fn decrypt_file(enc_path: &str, pad_path: &str) -> io::Result<PathBuf> {
@@ -894,189 +610,897 @@ fn pad_message_decrypt(pad_path: &str, message: &str) -> io::Result<(String, usi
     Ok((plaintext_str, start, end))
 }
 
-fn run_wizard() -> io::Result<()> {
-    fn print_menu() {
-        println!("Welcome to Bytefall!");
-        println!("How can I help you?");
-        println!("  1) Generate pad");
-        println!("  2) Quick encrypt");
-        println!("  3) Quick decrypt");
-        println!("  4) Pad encrypt");
-        println!("  5) Pad decrypt");
-        println!("  6) Pad message");
-        println!("  7) Pad balance");
-        println!("  8) Quit");
+fn append_message_pad(kind: &str, content: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(MESSAGE_PAD_PATH)
+    {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        let _ = writeln!(file, "--- {kind} @ {ts} ---");
+        let _ = writeln!(file, "{}", content.trim_end());
+        let _ = writeln!(file);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WizardAction {
+    GeneratePad,
+    QuickEncrypt,
+    QuickDecrypt,
+    PadEncrypt,
+    PadDecrypt,
+    PadMessageEncrypt,
+    PadMessageDecrypt,
+    PadBalance,
+    Quit,
+}
+
+struct InputField {
+    label: String,
+    value: String,
+    multiline: bool,
+}
+
+impl InputField {
+    fn new(label: &str, value: String, multiline: bool) -> Self {
+        Self {
+            label: label.to_string(),
+            value,
+            multiline,
+        }
+    }
+}
+
+struct PadProgress {
+    target_len: usize,
+    pad_writer: PadWriter,
+    recent: VecDeque<u8>,
+    chunk: Vec<u8>,
+    done: usize,
+    rng: OsRng,
+    finished: bool,
+    error: Option<String>,
+}
+
+impl PadProgress {
+    fn new(target_len: usize) -> io::Result<Self> {
+        Ok(Self {
+            target_len,
+            pad_writer: PadWriter::new(DEFAULT_PAD_PATH)?,
+            recent: VecDeque::new(),
+            chunk: vec![0u8; 4096],
+            done: 0,
+            rng: OsRng,
+            finished: false,
+            error: None,
+        })
     }
 
-    loop {
-        print_menu();
-        let choice = prompt_line("> ")?;
-
-        match choice.as_str() {
-            "1" => {
-                let pad_length = prompt_pad_length()?;
-                if let Err(err) = run_animation(OsRng, pad_length) {
-                    println!("Generation failed: {err}");
-                }
-            }
-            "2" => {
-                let file_path = prompt_line("Enter the path to the file: ")?;
-                if file_path.is_empty() {
-                    println!("Please enter a valid file path.");
-                    continue;
-                }
-
-                let mut rng = OsRng;
-                if let Err(err) = encrypt_file(&file_path, &mut rng).map(|result| {
-                    println!("Encryption complete.");
-                    println!("Encrypted file: {}", result.output_path.display());
-                    println!("Pad key: {}", result.pad_path.display());
-                }) {
-                    println!("Encryption failed: {err}");
-                }
-            }
-            "3" => {
-                let enc_path = prompt_line("Enter the path to the glyph-encrypted file: ")?;
-                if enc_path.is_empty() {
-                    println!("Please enter a valid file path.");
-                    continue;
-                }
-                let pad_path =
-                    resolve_glyph_key_path(&enc_path, "Enter the path to the pad key: ")?;
-
-                match decrypt_file(&enc_path, &pad_path) {
-                    Ok(output_path) => {
-                        println!("Decryption complete.");
-                        println!("Decrypted file: {}", output_path.display());
-                    }
-                    Err(err) => {
-                        println!("Decryption failed: {err}");
-                    }
-                }
-            }
-            "4" => {
-                let pad_path = resolve_glyph_pad_path(
-                    &format!("Enter the path to {DEFAULT_PAD_PATH}: "),
-                )?;
-                let file_path = prompt_line("Enter the path to the file to encrypt: ")?;
-                if file_path.is_empty() {
-                    println!("Please enter a valid file path.");
-                    continue;
-                }
-
-                match pad_encrypt(&file_path, &pad_path) {
-                    Ok(result) => {
-                        println!("Pad encryption complete.");
-                        println!("Encrypted file: {}", result.output_path.display());
-                        println!(
-                            "Pad bytes used: {}-{} (start-end, end exclusive)",
-                            result.start, result.end
-                        );
-                    }
-                    Err(err) => {
-                        println!("Pad encryption failed: {err}");
-                    }
-                }
-            }
-            "5" => {
-                let enc_path = prompt_line("Enter the path to the .glyphs encrypted file: ")?;
-                if enc_path.is_empty() {
-                    println!("Please enter a valid file path.");
-                    continue;
-                }
-                let pad_path = resolve_glyph_pad_path(
-                    &format!("Enter the path to {DEFAULT_PAD_PATH}: "),
-                )?;
-
-                match pad_decrypt(&enc_path, &pad_path) {
-                    Ok(result) => {
-                        println!("Pad decryption complete.");
-                        println!("Decrypted file: {}", result.output_path.display());
-                    }
-                    Err(err) => {
-                        println!("Pad decryption failed: {err}");
-                    }
-                }
-            }
-            "6" => {
-                let pad_path = resolve_glyph_pad_path(
-                    &format!("Enter the path to {DEFAULT_PAD_PATH}: "),
-                )?;
-                let mode = prompt_line("Encrypt or decrypt? (e/d): ")?;
-
-                match mode.to_lowercase().as_str() {
-                    "e" => {
-                        let plaintext = prompt_multiline(
-                            "Enter the message to encrypt (glyph output will follow):",
-                        )?;
-                        if plaintext.is_empty() {
-                            println!("Message cannot be empty.");
-                            continue;
-                        }
-
-                        match pad_message_encrypt(&pad_path, &plaintext) {
-                            Ok((message, start, end)) => {
-                                println!(
-                                    "Pad bytes used: {}-{} (start-end, end exclusive)",
-                                    start, end
-                                );
-                                println!("Encrypted message (copy/paste below):");
-                                println!("{}", message);
-                            }
-                            Err(err) => {
-                                println!("Message encryption failed: {err}");
-                            }
-                        }
-                    }
-                    "d" => {
-                        let pasted = prompt_multiline(
-                            "Paste the encrypted glyph message (including headers) and leave a blank line to finish:",
-                        )?;
-                        if pasted.is_empty() {
-                            println!("Message cannot be empty.");
-                            continue;
-                        }
-
-                        match pad_message_decrypt(&pad_path, &pasted) {
-                            Ok((plaintext, start, end)) => {
-                                println!(
-                                    "Pad bytes consumed: {}-{} (start-end, end exclusive)",
-                                    start, end
-                                );
-                                println!("Decrypted message:");
-                                println!("{}", plaintext);
-                            }
-                            Err(err) => {
-                                println!("Message decryption failed: {err}");
-                            }
-                        }
-                    }
-                    _ => {
-                        println!("Please choose 'e' for encrypt or 'd' for decrypt.");
-                    }
-                }
-            }
-            "7" => {
-                let pad_path = resolve_glyph_pad_path(
-                    &format!("Enter the path to {DEFAULT_PAD_PATH}: "),
-                )?;
-                match pad_balance(&pad_path) {
-                    Ok((used, total)) => {
-                        let remaining = total.saturating_sub(used);
-                        println!("Pad total bytes: {total}");
-                        println!("Pad used bytes: {used}");
-                        println!("Pad remaining bytes: {remaining}");
-                    }
-                    Err(err) => {
-                        println!("Unable to read pad balance: {err}");
-                    }
-                }
-            }
-            "8" => return Ok(()),
-            _ => println!("Please choose 1, 2, 3, 4, 5, 6, 7, or 8."),
+    fn step(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.done >= self.target_len {
+            self.pad_writer.finish()?;
+            self.finished = true;
+            return Ok(());
         }
 
-        println!("\n----------------------------------------\n");
+        let remaining = self.target_len - self.done;
+        let chunk_size = remaining.min(self.chunk.len());
+        self.rng.fill_bytes(&mut self.chunk[..chunk_size]);
+        for byte in &self.chunk[..chunk_size] {
+            self.pad_writer.push_byte(*byte)?;
+            self.recent.push_back(*byte);
+            if self.recent.len() > 64 {
+                self.recent.pop_front();
+            }
+        }
+        self.done += chunk_size;
+
+        if self.done >= self.target_len {
+            self.pad_writer.finish()?;
+            self.finished = true;
+        }
+        Ok(())
+    }
+
+    fn ratio(&self) -> f64 {
+        if self.target_len == 0 {
+            0.0
+        } else {
+            self.done as f64 / self.target_len as f64
+        }
+    }
+
+    fn glyph_preview(&self) -> String {
+        self.recent.iter().map(|b| glyph_from_byte(*b)).collect()
+    }
+}
+
+struct ActionView {
+    action: WizardAction,
+    fields: Vec<InputField>,
+    selected: usize,
+    editing: bool,
+    status: Vec<String>,
+    busy: bool,
+    pad_progress: Option<PadProgress>,
+    available: Vec<String>,
+    focus: Focus,
+    candidate_idx: usize,
+    output_panel: Option<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Fields,
+    Candidates,
+}
+
+enum Screen {
+    Menu { selected: usize },
+    Action(ActionView),
+}
+
+struct App {
+    screen: Screen,
+    last_tick: Instant,
+}
+
+fn push_status(view: &mut ActionView, msg: impl Into<String>) {
+    view.status.push(msg.into());
+    if view.status.len() > 8 {
+        let overflow = view.status.len() - 8;
+        view.status.drain(0..overflow);
+    }
+}
+
+fn action_label(action: WizardAction) -> &'static str {
+    match action {
+        WizardAction::GeneratePad => "Generate pad",
+        WizardAction::QuickEncrypt => "Quick encrypt",
+        WizardAction::QuickDecrypt => "Quick decrypt",
+        WizardAction::PadEncrypt => "Pad encrypt",
+        WizardAction::PadDecrypt => "Pad decrypt",
+        WizardAction::PadMessageEncrypt => "Pad message (encrypt)",
+        WizardAction::PadMessageDecrypt => "Pad message (decrypt)",
+        WizardAction::PadBalance => "Pad balance",
+        WizardAction::Quit => "Quit",
+    }
+}
+
+fn build_action_view(action: WizardAction) -> io::Result<ActionView> {
+    let mut status = Vec::new();
+    status.push(format!("{}", action_label(action)));
+
+    let (fields, mut available) = match action {
+        WizardAction::GeneratePad => (
+            vec![InputField::new(
+                "Pad length bytes (blank for 1048576)",
+                String::new(),
+                false,
+            )],
+            Vec::new(),
+        ),
+        WizardAction::QuickEncrypt => {
+            let detected = detect_encryptable_files()?;
+            let default = detected.first().cloned().unwrap_or_default();
+            (
+                vec![InputField::new("File to encrypt", default, false)],
+                detected,
+            )
+        }
+        WizardAction::QuickDecrypt => {
+            let encs = list_files_with_extension(GLYPH_ENCRYPTED_EXT)?;
+            let enc_default = encs.first().cloned().unwrap_or_default();
+            let key_default = auto_glyph_key_path(&enc_default).unwrap_or_default();
+            (
+                vec![
+                    InputField::new("Encrypted .glyph file", enc_default, false),
+                    InputField::new("Pad key (.glyphkey.bin)", key_default, false),
+                ],
+                encs,
+            )
+        }
+        WizardAction::PadEncrypt => {
+            let detected = detect_encryptable_files()?;
+            let default_file = detected.first().cloned().unwrap_or_default();
+            (
+                vec![InputField::new("File to pad-encrypt", default_file, false)],
+                detected,
+            )
+        }
+        WizardAction::PadDecrypt => {
+            let encs = list_files_with_extension(PAD_ENCRYPTED_EXT)?;
+            let enc_default = encs.first().cloned().unwrap_or_default();
+            (
+                vec![InputField::new("Encrypted .glyphs file", enc_default, false)],
+                encs,
+            )
+        }
+        WizardAction::PadMessageEncrypt => (
+            vec![InputField::new("Message to encrypt", String::new(), true)],
+            Vec::new(),
+        ),
+        WizardAction::PadMessageDecrypt => (
+            vec![InputField::new("Glyph message to decrypt", String::new(), true)],
+            Vec::new(),
+        ),
+        WizardAction::PadBalance => (Vec::new(), Vec::new()),
+        WizardAction::Quit => (Vec::new(), Vec::new()),
+    };
+
+    available.sort();
+    let candidate_idx = 0;
+    let focus = if matches!(action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt)
+        && !available.is_empty()
+    {
+        Focus::Candidates
+    } else {
+        Focus::Fields
+    };
+
+    let editing_default = focus == Focus::Fields
+        && !fields.is_empty()
+        && !matches!(action, WizardAction::GeneratePad | WizardAction::Quit);
+
+    Ok(ActionView {
+        action,
+        fields,
+        selected: 0,
+        editing: editing_default,
+        status,
+        busy: false,
+        pad_progress: None,
+        available,
+        focus,
+        candidate_idx,
+        output_panel: None,
+    })
+}
+
+fn draw_menu(f: &mut ratatui::Frame, selected: usize) {
+    use ratatui::layout::*;
+    use ratatui::widgets::*;
+
+    let area = f.area();
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(2),
+    ])
+    .split(area);
+
+    let title = Paragraph::new("Hieroglyph - TUI wizard")
+        .alignment(Alignment::Center)
+        .block(Block::bordered().title("Welcome"));
+    f.render_widget(title, chunks[0]);
+
+    let actions = [
+        WizardAction::GeneratePad,
+        WizardAction::QuickEncrypt,
+        WizardAction::QuickDecrypt,
+        WizardAction::PadEncrypt,
+        WizardAction::PadDecrypt,
+        WizardAction::PadMessageEncrypt,
+        WizardAction::PadMessageDecrypt,
+        WizardAction::PadBalance,
+        WizardAction::Quit,
+    ];
+    let items: Vec<ListItem> = actions
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| {
+            let content = format!("{} {}", if idx == selected {"→"} else {" "}, action_label(*action));
+            ListItem::new(content)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::bordered().title("Choose an action"))
+        .highlight_symbol("");
+    f.render_widget(list, chunks[1]);
+
+    let footer = Paragraph::new("Use ↑/↓ to move, Enter to select, q to quit.")
+        .alignment(Alignment::Center)
+        .block(Block::bordered());
+    f.render_widget(footer, chunks[2]);
+}
+
+fn draw_action(f: &mut ratatui::Frame, view: &ActionView) {
+    use ratatui::layout::*;
+    use ratatui::style::*;
+    use ratatui::widgets::*;
+
+    let area = f.area();
+    let outer = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(7),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    let header_text = format!(
+        "{}{}",
+        action_label(view.action),
+        if view.busy { " (running...)" } else { "" }
+    );
+    let header = Paragraph::new(header_text)
+        .alignment(Alignment::Center)
+        .block(Block::bordered().title("Action"));
+    f.render_widget(header, outer[0]);
+
+    let mid = Layout::horizontal([
+        Constraint::Percentage(55),
+        Constraint::Percentage(45),
+    ])
+    .split(outer[1]);
+
+    let show_candidates = !view.available.is_empty()
+        && matches!(view.action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt);
+
+    let left_chunks = if show_candidates {
+        Layout::vertical([
+            Constraint::Min(5),
+            Constraint::Length((view.available.len().saturating_mul(1) + 2) as u16),
+        ])
+        .split(mid[0])
+    } else {
+        Layout::vertical([Constraint::Min(5)]).split(mid[0])
+    };
+
+    let mut items = Vec::new();
+    for (idx, field) in view.fields.iter().enumerate() {
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![Span::styled(
+            format!("{}:", field.label),
+            Style::default().fg(Color::Cyan),
+        )]));
+        if field.value.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "<empty>",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for val_line in field.value.lines() {
+                lines.push(Line::from(val_line.to_string()));
+            }
+        }
+
+        let mut item = ListItem::new(lines);
+        if view.focus == Focus::Fields && idx == view.selected {
+            let style = if view.editing {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::LightGreen)
+            };
+            item = item.style(style);
+        }
+        items.push(item);
+    }
+
+    let list = List::new(items)
+        .block(Block::bordered().title("Fields"))
+        .highlight_symbol("");
+    f.render_widget(list, left_chunks[0]);
+
+    if show_candidates {
+        let mut list_items = Vec::new();
+        for (idx, path) in view.available.iter().enumerate() {
+            let prefix = if view.focus == Focus::Candidates && view.candidate_idx == idx {
+                "→ "
+            } else {
+                "  "
+            };
+            list_items.push(ListItem::new(format!("{}{}", prefix, path)));
+        }
+        let list = List::new(list_items)
+            .block(Block::bordered().title("Files"))
+            .highlight_symbol("");
+        f.render_widget(list, left_chunks[1]);
+    }
+
+    if let Some(progress) = &view.pad_progress {
+        let gauge_area = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(3),
+        ])
+        .split(mid[1]);
+        let gauge = Gauge::default()
+            .block(Block::bordered().title("Pad generation"))
+            .ratio(progress.ratio())
+            .label(format!("{}/{} bytes", progress.done, progress.target_len));
+        f.render_widget(gauge, gauge_area[0]);
+
+        let preview = Paragraph::new(progress.glyph_preview())
+            .block(Block::bordered().title("Recent glyph stream"));
+        f.render_widget(preview, gauge_area[1]);
+    } else {
+        let show_extra = matches!(view.action, WizardAction::QuickDecrypt | WizardAction::PadDecrypt);
+        let has_output = view.output_panel.is_some();
+
+        let mut vertical = Vec::new();
+        if has_output {
+            vertical.push(Constraint::Length(9));
+        }
+        if show_extra {
+            vertical.push(Constraint::Length(7));
+        }
+        vertical.push(Constraint::Min(5));
+
+        let cols = Layout::vertical(vertical).split(mid[1]);
+        let mut col_idx = 0;
+
+        if let Some((title, content)) = &view.output_panel {
+            let output = Paragraph::new(content.clone())
+                .block(Block::bordered().title(title.as_str()))
+                .wrap(Wrap { trim: false });
+            f.render_widget(output, cols[col_idx]);
+            col_idx += 1;
+        }
+
+        if show_extra {
+            let frames = ["⏳", "✦", "✸", "✧", "✺", "✹"];
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0));
+            let idx = ((now.as_millis() / 150) as usize) % frames.len();
+            let glyph_seed = (now.subsec_nanos() as u64).to_le_bytes();
+            let mut preview = String::new();
+            for b in glyph_seed {
+                preview.push(glyph_from_byte(b));
+            }
+            let extra = Paragraph::new(format!(
+                "Decrypt lounge {}\nGlyph drift: {}",
+                frames[idx], preview
+            ))
+            .block(Block::bordered().title("Decryption vibes"));
+            f.render_widget(extra, cols[col_idx]);
+            col_idx += 1;
+        }
+
+        let status_text: String = if view.status.is_empty() {
+            "Status messages will appear here.".to_string()
+        } else {
+            view.status.join("\n")
+        };
+        let status = Paragraph::new(status_text)
+            .block(Block::bordered().title("Status"))
+            .wrap(Wrap { trim: true });
+        f.render_widget(status, cols[col_idx]);
+    }
+
+    let instructions = if view.editing {
+        "Esc: stop editing | Backspace: delete | Enter: newline (multiline) / finish edit (single) | Tab/Shift+Tab: move"
+    } else if matches!(view.action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt)
+        && !view.available.is_empty()
+    {
+        "Enter: run | e: edit | Tab/Shift+Tab or ↑/↓: move | ↓ from last field to files, ↑ from files to fields | Enter on file: fill"
+    } else {
+        "Enter: run action | e: edit field | Tab/Shift+Tab or ↑/↓: move | Esc: back to menu"
+    };
+    let footer = Paragraph::new(instructions)
+        .alignment(Alignment::Center)
+        .block(Block::bordered());
+    f.render_widget(footer, outer[2]);
+}
+
+fn handle_char_input(field: &mut InputField, key: KeyCode, modifiers: KeyModifiers) {
+    match key {
+        KeyCode::Char(c) => {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                return;
+            }
+            field.value.push(c);
+        }
+        KeyCode::Backspace => {
+            field.value.pop();
+        }
+        KeyCode::Enter => {
+            if field.multiline {
+                field.value.push('\n');
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {}
+        _ => {}
+    }
+}
+
+fn run_action_now(view: &mut ActionView) {
+    if view.busy {
+        return;
+    }
+
+    match view.action {
+        WizardAction::GeneratePad => {
+            let length_str = view.fields[0].value.trim();
+            let target_len = if length_str.is_empty() {
+                1_048_576usize
+            } else {
+                match length_str.parse::<usize>() {
+                    Ok(v) if v > 0 => v,
+                    _ => {
+                        push_status(view, "Please enter a positive number for pad length.");
+                        return;
+                    }
+                }
+            };
+
+            match PadProgress::new(target_len) {
+                Ok(progress) => {
+                    view.pad_progress = Some(progress);
+                    view.busy = true;
+                    push_status(view, format!("Generating {} bytes to {}", target_len, DEFAULT_PAD_PATH));
+                }
+                Err(err) => push_status(view, format!("Unable to start generation: {err}")),
+            }
+        }
+        WizardAction::QuickEncrypt => {
+            let file = view.fields[0].value.trim();
+            if file.is_empty() {
+                push_status(view, "Please provide a file to encrypt.");
+                return;
+            }
+            view.busy = true;
+            match encrypt_file(file, &mut OsRng) {
+                Ok(result) => {
+                    push_status(view, format!("Encrypted file: {}", result.output_path.display()));
+                    push_status(view, format!("Pad key: {}", result.pad_path.display()));
+                }
+                Err(err) => push_status(view, format!("Encryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::QuickDecrypt => {
+            let enc = view.fields[0].value.trim().to_string();
+            let mut key = view.fields[1].value.trim().to_string();
+            if enc.is_empty() {
+                push_status(view, "Please provide an encrypted .glyph file.");
+                return;
+            }
+            if key.is_empty() {
+                if let Some(auto) = auto_glyph_key_path(&enc) {
+                    key = auto;
+                    view.fields[1].value = key.clone();
+                    push_status(view, "Auto-selected matching pad key.");
+                } else {
+                    push_status(view, "Please provide the matching pad key file.");
+                    return;
+                }
+            }
+            view.busy = true;
+            match decrypt_file(&enc, &key) {
+                Ok(path) => push_status(view, format!("Decrypted to {}", path.display())),
+                Err(err) => push_status(view, format!("Decryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::PadEncrypt => {
+            let pad = DEFAULT_PAD_PATH;
+            let file = view.fields[0].value.trim();
+            if file.is_empty() {
+                push_status(view, "Provide a file path.");
+                return;
+            }
+            view.busy = true;
+            match pad_encrypt(file, pad) {
+                Ok(result) => {
+                    push_status(view, format!("Encrypted file: {}", result.output_path.display()));
+                    push_status(view, format!(
+                        "Pad bytes used: {}-{} (end exclusive)",
+                        result.start, result.end
+                    ));
+                }
+                Err(err) => push_status(view, format!("Pad encryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::PadDecrypt => {
+            let pad = DEFAULT_PAD_PATH;
+            let enc = view.fields[0].value.trim();
+            if enc.is_empty() {
+                push_status(view, "Provide the encrypted file path.");
+                return;
+            }
+            view.busy = true;
+            match pad_decrypt(enc, pad) {
+                Ok(result) => push_status(view, format!("Decrypted to {}", result.output_path.display())),
+                Err(err) => push_status(view, format!("Pad decryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::PadMessageEncrypt => {
+            let pad = DEFAULT_PAD_PATH;
+            let msg = &view.fields[0].value;
+            if msg.trim().is_empty() {
+                push_status(view, "Provide a message to encrypt.");
+                return;
+            }
+            view.busy = true;
+            match pad_message_encrypt(pad, msg) {
+                Ok((cipher, start, end)) => {
+                    push_status(view, format!("Pad bytes used: {}-{}", start, end));
+                    push_status(view, "Encrypted message shown on the right.");
+                    view.output_panel = Some(("Encrypted message".to_string(), cipher.clone()));
+                    append_message_pad("ENCRYPTED", &cipher);
+                    push_status(view, format!("Saved to {MESSAGE_PAD_PATH}"));
+                }
+                Err(err) => push_status(view, format!("Message encryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::PadMessageDecrypt => {
+            let pad = DEFAULT_PAD_PATH;
+            let msg = &view.fields[0].value;
+            if msg.trim().is_empty() {
+                push_status(view, "Provide the glyph message.");
+                return;
+            }
+            view.busy = true;
+            match pad_message_decrypt(pad, msg) {
+                Ok((plain, start, end)) => {
+                    push_status(view, format!("Pad bytes consumed: {}-{}", start, end));
+                    push_status(view, "Decrypted message shown on the right.");
+                    view.output_panel = Some(("Decrypted message".to_string(), plain.clone()));
+                    append_message_pad("DECRYPTED", &plain);
+                    push_status(view, format!("Saved to {MESSAGE_PAD_PATH}"));
+                }
+                Err(err) => push_status(view, format!("Message decryption failed: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::PadBalance => {
+            let pad = DEFAULT_PAD_PATH;
+            view.busy = true;
+            match pad_balance(pad) {
+                Ok((used, total)) => {
+                    let remaining = total.saturating_sub(used);
+                    push_status(view, format!("Pad total: {} bytes", total));
+                    push_status(view, format!("Used: {} bytes", used));
+                    push_status(view, format!("Remaining: {} bytes", remaining));
+                }
+                Err(err) => push_status(view, format!("Unable to read pad balance: {err}")),
+            }
+            view.busy = false;
+        }
+        WizardAction::Quit => {}
+    }
+}
+
+fn run_wizard() -> io::Result<()> {
+    use ratatui::Terminal;
+
+    let mut terminal: Terminal<_> = ratatui::init();
+    let mut app = App {
+        screen: Screen::Menu { selected: 0 },
+        last_tick: Instant::now(),
+    };
+
+    let tick_rate = Duration::from_millis(30);
+
+    loop {
+        terminal.draw(|f| match &app.screen {
+            Screen::Menu { selected } => draw_menu(f, *selected),
+            Screen::Action(view) => draw_action(f, view),
+        })?;
+
+        if let Screen::Action(view) = &mut app.screen {
+            let mut fail_message: Option<String> = None;
+            let mut complete: Option<usize> = None;
+            let mut clear_progress = false;
+
+            if let Some(progress) = &mut view.pad_progress {
+                if progress.error.is_none() && !progress.finished {
+                    if let Err(err) = progress.step() {
+                        progress.error = Some(err.to_string());
+                        fail_message = Some(err.to_string());
+                        view.busy = false;
+                        clear_progress = true;
+                    }
+                }
+                if progress.finished {
+                    complete = Some(progress.done);
+                    clear_progress = true;
+                }
+            }
+
+            if clear_progress {
+                view.pad_progress = None;
+            }
+
+            if let Some(done) = complete {
+                view.busy = false;
+                push_status(view, format!("Generated {} bytes to {}", done, DEFAULT_PAD_PATH));
+            }
+            if let Some(err) = fail_message {
+                push_status(view, format!("Generation failed: {}", err));
+            }
+        }
+
+        let timeout = tick_rate.saturating_sub(app.last_tick.elapsed());
+        if event::poll(timeout)? {
+            app.last_tick = Instant::now();
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match &mut app.screen {
+                    Screen::Menu { selected } => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            ratatui::restore();
+                            return Ok(());
+                        }
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < 8 {
+                                *selected += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let actions = [
+                                WizardAction::GeneratePad,
+                                WizardAction::QuickEncrypt,
+                                WizardAction::QuickDecrypt,
+                                WizardAction::PadEncrypt,
+                                WizardAction::PadDecrypt,
+                                WizardAction::PadMessageEncrypt,
+                                WizardAction::PadMessageDecrypt,
+                                WizardAction::PadBalance,
+                                WizardAction::Quit,
+                            ];
+                            let chosen = actions[*selected];
+                            if chosen == WizardAction::Quit {
+                                ratatui::restore();
+                                return Ok(());
+                            }
+                            match build_action_view(chosen) {
+                                Ok(view) => app.screen = Screen::Action(view),
+                                Err(err) => {
+                                    ratatui::restore();
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Screen::Action(view) => {
+                        let show_candidates = !view.available.is_empty()
+                            && !matches!(view.action, WizardAction::QuickDecrypt | WizardAction::PadDecrypt);
+
+                        if let Some(progress) = &view.pad_progress {
+                            if !progress.finished {
+                                if key.code == KeyCode::Esc {
+                                    app.screen = Screen::Menu { selected: 0 };
+                                }
+                                continue;
+                            }
+                        }
+
+                        if view.busy && view.pad_progress.is_none() {
+                            if key.code == KeyCode::Esc {
+                                app.screen = Screen::Menu { selected: 0 };
+                            }
+                            continue;
+                        }
+
+                        if view.editing {
+                            match key.code {
+                                KeyCode::Esc => view.editing = false,
+                                KeyCode::Tab => {
+                                    view.selected = (view.selected + 1) % view.fields.len();
+                                }
+                                KeyCode::BackTab => {
+                                    if view.selected == 0 {
+                                        view.selected = view.fields.len() - 1;
+                                    } else {
+                                        view.selected -= 1;
+                                    }
+                                }
+                                KeyCode::Enter if !view.fields[view.selected].multiline => {
+                                    view.editing = false;
+                                }
+                                _ => {
+                                    let field = &mut view.fields[view.selected];
+                                    handle_char_input(field, key.code, key.modifiers);
+                                }
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => app.screen = Screen::Menu { selected: 0 },
+                                KeyCode::Char('e') => view.editing = true,
+                                KeyCode::Tab => {
+                                    if !view.fields.is_empty() {
+                                        view.focus = Focus::Fields;
+                                        view.selected = (view.selected + 1) % view.fields.len();
+                                    }
+                                }
+                                KeyCode::BackTab => {
+                                    if !view.fields.is_empty() {
+                                        view.focus = Focus::Fields;
+                                        if view.selected == 0 {
+                                            view.selected = view.fields.len() - 1;
+                                        } else {
+                                            view.selected -= 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if show_candidates {
+                                        view.focus = Focus::Candidates;
+                                        if view.candidate_idx >= view.available.len() {
+                                            view.candidate_idx = 0;
+                                        }
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    view.focus = Focus::Fields;
+                                }
+                                KeyCode::Up => {
+                                    if view.focus == Focus::Candidates && show_candidates {
+                                        if view.candidate_idx == 0 {
+                                            view.candidate_idx = view.available.len() - 1;
+                                        }
+                                        view.focus = Focus::Fields;
+                                        if !view.fields.is_empty() {
+                                            view.selected = view.fields.len().saturating_sub(1);
+                                        }
+                                    } else if !view.fields.is_empty() {
+                                        if view.selected == 0 {
+                                            view.selected = view.fields.len() - 1;
+                                        } else {
+                                            view.selected -= 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if view.focus == Focus::Candidates && show_candidates {
+                                        view.candidate_idx = (view.candidate_idx + 1) % view.available.len();
+                                    } else if show_candidates && !view.fields.is_empty() && view.selected == view.fields.len() - 1 {
+                                        view.focus = Focus::Candidates;
+                                        if view.candidate_idx >= view.available.len() {
+                                            view.candidate_idx = 0;
+                                        }
+                                    } else if !view.fields.is_empty() {
+                                        view.selected = (view.selected + 1) % view.fields.len();
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if view.focus == Focus::Candidates && show_candidates {
+                                        let choice = view.available[view.candidate_idx].clone();
+                                        match view.action {
+                                            WizardAction::QuickEncrypt => {
+                                                view.fields[0].value = choice;
+                                            }
+                                            WizardAction::PadEncrypt => {
+                                                if !view.fields.is_empty() {
+                                                    view.fields[0].value = choice;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        view.focus = Focus::Fields;
+                                        view.selected = 0;
+                                        view.editing = false;
+                                    } else {
+                                        run_action_now(view);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
