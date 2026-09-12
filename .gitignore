@@ -8,3 +8,6 @@ glyph.txt
 *.dec
 *.idx
 message_pad.txt
+pad.bin
+*.pad
+*.glyphkey.bin
