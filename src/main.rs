@@ -2,17 +2,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fs2::FileExt;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use ratatui::text::{Line, Span};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+mod interface;
+use interface::{draw_action, draw_menu, handle_action_event};
 
 const DEFAULT_PAD_PATH: &str = "pad.bin";
-const GLYPH_ENCRYPTED_EXT: &str = "glyph";
-const PAD_ENCRYPTED_EXT: &str = "glyphs";
 const MESSAGE_PAD_PATH: &str = "message_pad.txt";
 
 struct PadWriter {
@@ -22,11 +20,24 @@ struct PadWriter {
 
 impl PadWriter {
     fn new(path: &str) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        if read_pad_index_path(Path::new(path)).exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                "A pad index already exists for this path. Choose a new pad name; do not reset an old index."));
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(err.kind(), "Pad already exists. Choose a new path to keep the existing pad safe.")
+            } else {
+                err
+            }
+        })?;
         file.lock_exclusive()?;
 
         Ok(Self {
@@ -64,12 +75,39 @@ fn byte_from_glyph(ch: char) -> Option<u8> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  bytefall                 # Launch the interactive wizard");
-    println!("  bytefall -length <n>     # Run Bytefall pad generation headlessly (no wizard)");
+    println!("  hieroglyph                                  # Open the wizard");
+    println!("  hieroglyph --length <size> [--pad <path>]     # Create a new pad without the wizard");
+    println!("Sizes: 1024, 64KiB, or \"10 MiB\". Default pad path: {DEFAULT_PAD_PATH}");
+    println!("Existing pads are never overwritten. Use separate pads for each sending direction.");
 }
 
-fn generate_pad_headless(mut rng: OsRng, target_len: usize) -> std::io::Result<()> {
-    let mut pad_writer = PadWriter::new(DEFAULT_PAD_PATH)?;
+fn parse_pad_size(input: &str) -> io::Result<usize> {
+    let input = input.trim();
+    let digits = input.bytes().take_while(u8::is_ascii_digit).count();
+    let amount = input[..digits].parse::<usize>().ok();
+    let multiplier = match input[digits..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        _ => 0,
+    };
+    amount.and_then(|n| n.checked_mul(multiplier)).filter(|n| *n > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+            "Enter a positive whole-byte size, for example 1024, 64 KiB, or 10 MiB (within platform limits)."))
+}
+
+fn format_bytes(bytes: usize) -> String {
+    for (unit, factor) in [("GiB", 1024 * 1024 * 1024), ("MiB", 1024 * 1024), ("KiB", 1024)] {
+        if bytes >= factor {
+            return format!("{:.1} {unit} ({bytes} bytes)", bytes as f64 / factor as f64);
+        }
+    }
+    format!("{bytes} bytes")
+}
+
+fn generate_pad_headless(mut rng: OsRng, target_len: usize, path: &str) -> std::io::Result<()> {
+    let mut pad_writer = PadWriter::new(path)?;
     let mut chunk = vec![0u8; 4096];
     let mut written = 0usize;
 
@@ -86,66 +124,7 @@ fn generate_pad_headless(mut rng: OsRng, target_len: usize) -> std::io::Result<(
     }
 
     pad_writer.finish()?;
-    println!("Generated {target_len} bytes to {}", DEFAULT_PAD_PATH);
-    Ok(())
-}
-
-fn run_animation(mut rng: OsRng, target_len: Option<usize>) -> std::io::Result<()> {
-    use ratatui::prelude::*;
-    use ratatui::widgets::*;
-
-    if target_len.is_none() {
-        return generate_pad_headless(rng, 1024 * 1024);
-    }
-
-    let target_len = target_len.unwrap_or(0);
-    let mut terminal = ratatui::init();
-    let mut pad_writer = PadWriter::new(DEFAULT_PAD_PATH)?;
-    let mut chunk = vec![0u8; 4096];
-    let mut recent = VecDeque::<u8>::new();
-
-    while pad_writer.count < target_len {
-        let remaining = target_len - pad_writer.count;
-        let chunk_size = remaining.min(chunk.len());
-        rng.fill_bytes(&mut chunk[..chunk_size]);
-        for byte in &chunk[..chunk_size] {
-            pad_writer.push_byte(*byte)?;
-            recent.push_back(*byte);
-            if recent.len() > 64 {
-                recent.pop_front();
-            }
-        }
-
-        let done = pad_writer.count;
-        terminal.draw(|f| {
-            let area = f.area();
-            let vertical = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(5),
-            ])
-            .split(area);
-
-            let title = Paragraph::new("Hieroglyph - Pad Generation")
-                .block(Block::bordered().title("Status"));
-            f.render_widget(title, vertical[0]);
-
-            let gauge = Gauge::default()
-                .block(Block::bordered().title("Progress"))
-                .ratio(done as f64 / target_len as f64)
-                .label(format!("{done}/{target_len} bytes"));
-            f.render_widget(gauge, vertical[1]);
-
-            let glyphs: String = recent.iter().map(|b| glyph_from_byte(*b)).collect();
-            let preview = Paragraph::new(glyphs)
-                .block(Block::bordered().title("Recent glyph stream"));
-            f.render_widget(preview, vertical[2]);
-        })?;
-    }
-
-    pad_writer.finish()?;
-    ratatui::restore();
-    println!("Generated {target_len} bytes to {}", DEFAULT_PAD_PATH);
+    println!("Created {} at {path}. Share securely; never reuse pad bytes.", format_bytes(target_len));
     Ok(())
 }
 
@@ -292,33 +271,6 @@ fn pad_length_bytes(path: &str) -> io::Result<usize> {
     })
 }
 
-fn list_files_with_extension(ext: &str) -> io::Result<Vec<String>> {
-    let mut matches = Vec::new();
-    for entry in std::fs::read_dir(env::current_dir()?)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            matches.push(path.to_string_lossy().to_string());
-        }
-    }
-    matches.sort();
-    Ok(matches)
-}
-
-fn detect_encryptable_files() -> io::Result<Vec<String>> {
-    let mut matches = Vec::new();
-    for entry in std::fs::read_dir(env::current_dir()?)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        matches.push(path.to_string_lossy().to_string());
-    }
-    matches.sort();
-    Ok(matches)
-}
-
 fn auto_glyph_key_path(enc_path: &str) -> Option<String> {
     let enc_path = Path::new(enc_path);
     let parent = enc_path.parent().unwrap_or_else(|| Path::new("."));
@@ -441,6 +393,18 @@ fn pad_balance(pad_path: &str) -> io::Result<(usize, usize)> {
     Ok((used, total))
 }
 
+fn checked_pad_end(pad_path: &str, start: usize, needed: usize) -> io::Result<usize> {
+    let total = pad_length_bytes(pad_path)?;
+    let remaining = total.checked_sub(start).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Pad index exceeds pad length; do not reset it.")
+    })?;
+    if needed > remaining {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!(
+            "Not enough unused pad bytes: need {needed}, have {remaining}. Create and securely share a new pad; never reset the index.")));
+    }
+    Ok(start + needed)
+}
+
 fn pad_encrypt(file_path: &str, pad_path: &str) -> io::Result<PadEncryptResult> {
     let input_path = Path::new(file_path);
     let mut input = Vec::new();
@@ -448,9 +412,12 @@ fn pad_encrypt(file_path: &str, pad_path: &str) -> io::Result<PadEncryptResult> 
 
     let mut idx_guard = lock_pad_index(Path::new(pad_path))?;
     let start = idx_guard.read()?;
-    let cipher_end = start + input.len();
+    let needed = input.len().checked_add(PAD_HASH_LEN).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Input is too large")
+    })?;
+    let hash_key_end = checked_pad_end(pad_path, start, needed)?;
+    let cipher_end = hash_key_end - PAD_HASH_LEN;
     let hash_key_start = cipher_end;
-    let hash_key_end = hash_key_start + PAD_HASH_LEN;
     let header = format!("{PAD_HEADER_PREFIX} {start}-{cipher_end}\n");
     let pad_slice = read_pad_slice(pad_path, start, cipher_end)?;
     let hash_key = read_pad_slice(pad_path, hash_key_start, hash_key_end)?;
@@ -552,7 +519,7 @@ fn pad_message_encrypt(pad_path: &str, plaintext: &str) -> io::Result<(String, u
     let bytes = plaintext.as_bytes();
     let mut idx_guard = lock_pad_index(Path::new(pad_path))?;
     let start = idx_guard.read()?;
-    let end = start + bytes.len();
+    let end = checked_pad_end(pad_path, start, bytes.len())?;
 
     let pad_slice = read_pad_slice(pad_path, start, end)?;
 
@@ -639,26 +606,42 @@ enum WizardAction {
     Quit,
 }
 
+const WIZARD_ACTIONS: &[WizardAction] = &[
+    WizardAction::GeneratePad,
+    WizardAction::PadBalance,
+    WizardAction::PadEncrypt,
+    WizardAction::PadDecrypt,
+    WizardAction::PadMessageEncrypt,
+    WizardAction::PadMessageDecrypt,
+    WizardAction::QuickEncrypt,
+    WizardAction::QuickDecrypt,
+    WizardAction::Quit,
+];
+
 struct InputField {
     label: String,
     value: String,
     multiline: bool,
+    cursor: usize,
+    select_all: bool,
 }
 
 impl InputField {
     fn new(label: &str, value: String, multiline: bool) -> Self {
         Self {
             label: label.to_string(),
+            cursor: value.len(),
             value,
             multiline,
+            select_all: false,
         }
     }
 }
 
 struct PadProgress {
     target_len: usize,
+    path: String,
     pad_writer: PadWriter,
-    recent: VecDeque<u8>,
     chunk: Vec<u8>,
     done: usize,
     rng: OsRng,
@@ -667,12 +650,12 @@ struct PadProgress {
 }
 
 impl PadProgress {
-    fn new(target_len: usize) -> io::Result<Self> {
+    fn new(target_len: usize, path: &str) -> io::Result<Self> {
         Ok(Self {
             target_len,
-            pad_writer: PadWriter::new(DEFAULT_PAD_PATH)?,
-            recent: VecDeque::new(),
-            chunk: vec![0u8; 4096],
+            path: path.to_string(),
+            pad_writer: PadWriter::new(path)?,
+            chunk: vec![0u8; 256 * 1024],
             done: 0,
             rng: OsRng,
             finished: false,
@@ -695,10 +678,6 @@ impl PadProgress {
         self.rng.fill_bytes(&mut self.chunk[..chunk_size]);
         for byte in &self.chunk[..chunk_size] {
             self.pad_writer.push_byte(*byte)?;
-            self.recent.push_back(*byte);
-            if self.recent.len() > 64 {
-                self.recent.pop_front();
-            }
         }
         self.done += chunk_size;
 
@@ -717,16 +696,12 @@ impl PadProgress {
         }
     }
 
-    fn glyph_preview(&self) -> String {
-        self.recent.iter().map(|b| glyph_from_byte(*b)).collect()
-    }
 }
 
 struct ActionView {
     action: WizardAction,
     fields: Vec<InputField>,
     selected: usize,
-    editing: bool,
     status: Vec<String>,
     busy: bool,
     pad_progress: Option<PadProgress>,
@@ -734,12 +709,31 @@ struct ActionView {
     focus: Focus,
     candidate_idx: usize,
     output_panel: Option<(String, String)>,
+    status_kind: StatusKind,
+    preset_idx: usize,
+    browse_field: usize,
+    picker_dir: PathBuf,
+    picker_error: Option<String>,
+    output_scroll: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Fields,
+    Presets,
+    Browse,
     Candidates,
+    Primary,
+    Back,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusKind {
+    Ready,
+    Running,
+    Success,
+    Error,
 }
 
 enum Screen {
@@ -749,7 +743,6 @@ enum Screen {
 
 struct App {
     screen: Screen,
-    last_tick: Instant,
 }
 
 fn push_status(view: &mut ActionView, msg: impl Into<String>) {
@@ -762,380 +755,131 @@ fn push_status(view: &mut ActionView, msg: impl Into<String>) {
 
 fn action_label(action: WizardAction) -> &'static str {
     match action {
-        WizardAction::GeneratePad => "Generate pad",
-        WizardAction::QuickEncrypt => "Quick encrypt",
-        WizardAction::QuickDecrypt => "Quick decrypt",
-        WizardAction::PadEncrypt => "Pad encrypt",
-        WizardAction::PadDecrypt => "Pad decrypt",
-        WizardAction::PadMessageEncrypt => "Pad message (encrypt)",
-        WizardAction::PadMessageDecrypt => "Pad message (decrypt)",
-        WizardAction::PadBalance => "Pad balance",
+        WizardAction::GeneratePad => "Create a shared pad",
+        WizardAction::QuickEncrypt => "Encrypt file with a new single-use pad",
+        WizardAction::QuickDecrypt => "Decrypt file with its single-use pad",
+        WizardAction::PadEncrypt => "Encrypt file with a shared pad",
+        WizardAction::PadDecrypt => "Decrypt file with a shared pad",
+        WizardAction::PadMessageEncrypt => "Encrypt a text message",
+        WizardAction::PadMessageDecrypt => "Decrypt a text message",
+        WizardAction::PadBalance => "Check remaining pad bytes",
         WizardAction::Quit => "Quit",
     }
 }
 
+fn action_description(action: WizardAction) -> &'static str {
+    match action {
+        WizardAction::GeneratePad => "Start here: create a pad and share a copy securely. Use a different pad for each sending direction. Existing pads will not be replaced.",
+        WizardAction::PadBalance => "Check how many bytes are left in the selected pad. Keep its .idx file: deleting or restoring an old index can cause dangerous byte reuse.",
+        WizardAction::PadEncrypt => "Choose a file and your outgoing pad. Consumes the file size plus 32 bytes for the legacy hash check. Send only the resulting .glyphs file.",
+        WizardAction::PadDecrypt => "Choose a .glyphs file and the sender's matching pad. Restores the file and advances the local pad index. The legacy hash check is not a standard MAC.",
+        WizardAction::PadMessageEncrypt => "Uses one pad byte per UTF-8 message byte. Copy the entire result, including its header. This legacy text format has NO authentication.",
+        WizardAction::PadMessageDecrypt => "Paste the full encrypted message, including its header. Plaintext is displayed but not automatically saved. This format cannot detect tampering.",
+        WizardAction::QuickEncrypt => "Creates a separate pad as long as this file. Share that pad securely, separately from the .glyph ciphertext. This format has NO authentication.",
+        WizardAction::QuickDecrypt => "Requires the matching .glyphkey.bin pad; it can be auto-selected beside the ciphertext. Wrong pads or tampering are not detected.",
+        WizardAction::Quit => "Close the app. Keep your pads secret and retain their current index files.",
+    }
+}
+
+fn uses_shared_pad(action: WizardAction) -> bool {
+    matches!(action, WizardAction::PadEncrypt | WizardAction::PadDecrypt
+        | WizardAction::PadMessageEncrypt | WizardAction::PadMessageDecrypt | WizardAction::PadBalance)
+}
+
 fn build_action_view(action: WizardAction) -> io::Result<ActionView> {
-    let mut status = Vec::new();
-    status.push(format!("{}", action_label(action)));
-
-    let (fields, mut available) = match action {
-        WizardAction::GeneratePad => (
-            vec![InputField::new(
-                "Pad length bytes (blank for 1048576)",
-                String::new(),
-                false,
-            )],
-            Vec::new(),
-        ),
-        WizardAction::QuickEncrypt => {
-            let detected = detect_encryptable_files()?;
-            let default = detected.first().cloned().unwrap_or_default();
-            (
-                vec![InputField::new("File to encrypt", default, false)],
-                detected,
-            )
-        }
-        WizardAction::QuickDecrypt => {
-            let encs = list_files_with_extension(GLYPH_ENCRYPTED_EXT)?;
-            let enc_default = encs.first().cloned().unwrap_or_default();
-            let key_default = auto_glyph_key_path(&enc_default).unwrap_or_default();
-            (
-                vec![
-                    InputField::new("Encrypted .glyph file", enc_default, false),
-                    InputField::new("Pad key (.glyphkey.bin)", key_default, false),
-                ],
-                encs,
-            )
-        }
-        WizardAction::PadEncrypt => {
-            let detected = detect_encryptable_files()?;
-            let default_file = detected.first().cloned().unwrap_or_default();
-            (
-                vec![InputField::new("File to pad-encrypt", default_file, false)],
-                detected,
-            )
-        }
-        WizardAction::PadDecrypt => {
-            let encs = list_files_with_extension(PAD_ENCRYPTED_EXT)?;
-            let enc_default = encs.first().cloned().unwrap_or_default();
-            (
-                vec![InputField::new("Encrypted .glyphs file", enc_default, false)],
-                encs,
-            )
-        }
-        WizardAction::PadMessageEncrypt => (
-            vec![InputField::new("Message to encrypt", String::new(), true)],
-            Vec::new(),
-        ),
-        WizardAction::PadMessageDecrypt => (
-            vec![InputField::new("Glyph message to decrypt", String::new(), true)],
-            Vec::new(),
-        ),
-        WizardAction::PadBalance => (Vec::new(), Vec::new()),
-        WizardAction::Quit => (Vec::new(), Vec::new()),
+    let mut fields = match action {
+        WizardAction::GeneratePad => vec![
+            InputField::new("Size", "1 MiB".into(), false),
+            InputField::new("Save as", DEFAULT_PAD_PATH.into(), false),
+        ],
+        WizardAction::QuickEncrypt | WizardAction::PadEncrypt => vec![
+            InputField::new("File", String::new(), false),
+        ],
+        WizardAction::QuickDecrypt => vec![
+            InputField::new("Encrypted file", String::new(), false),
+            InputField::new("Pad key", String::new(), false),
+        ],
+        WizardAction::PadDecrypt => vec![
+            InputField::new("Encrypted file", String::new(), false),
+        ],
+        WizardAction::PadMessageEncrypt => vec![
+            InputField::new("Message", String::new(), true),
+        ],
+        WizardAction::PadMessageDecrypt => vec![
+            InputField::new("Encrypted message", String::new(), true),
+        ],
+        WizardAction::PadBalance | WizardAction::Quit => Vec::new(),
     };
-
-    available.sort();
-    let candidate_idx = 0;
-    let focus = if matches!(action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt)
-        && !available.is_empty()
-    {
-        Focus::Candidates
-    } else {
-        Focus::Fields
-    };
-
-    let editing_default = focus == Focus::Fields
-        && !fields.is_empty()
-        && !matches!(action, WizardAction::GeneratePad | WizardAction::Quit);
-
+    if uses_shared_pad(action) {
+        fields.push(InputField::new("Shared pad", DEFAULT_PAD_PATH.into(), false));
+    }
+    if let Some(field) = fields.first_mut() {
+        field.select_all = !field.value.is_empty();
+    }
+    let focus = if fields.is_empty() { Focus::Back } else { Focus::Fields };
     Ok(ActionView {
         action,
         fields,
         selected: 0,
-        editing: editing_default,
-        status,
+        status: Vec::new(),
         busy: false,
         pad_progress: None,
-        available,
+        available: Vec::new(),
         focus,
-        candidate_idx,
+        candidate_idx: 0,
         output_panel: None,
+        status_kind: StatusKind::Ready,
+        preset_idx: 0,
+        browse_field: 0,
+        picker_dir: env::current_dir()?,
+        picker_error: None,
+        output_scroll: 0,
     })
-}
-
-fn draw_menu(f: &mut ratatui::Frame, selected: usize) {
-    use ratatui::layout::*;
-    use ratatui::widgets::*;
-
-    let area = f.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(5),
-        Constraint::Length(2),
-    ])
-    .split(area);
-
-    let title = Paragraph::new("Hieroglyph - TUI wizard")
-        .alignment(Alignment::Center)
-        .block(Block::bordered().title("Welcome"));
-    f.render_widget(title, chunks[0]);
-
-    let actions = [
-        WizardAction::GeneratePad,
-        WizardAction::QuickEncrypt,
-        WizardAction::QuickDecrypt,
-        WizardAction::PadEncrypt,
-        WizardAction::PadDecrypt,
-        WizardAction::PadMessageEncrypt,
-        WizardAction::PadMessageDecrypt,
-        WizardAction::PadBalance,
-        WizardAction::Quit,
-    ];
-    let items: Vec<ListItem> = actions
-        .iter()
-        .enumerate()
-        .map(|(idx, action)| {
-            let content = format!("{} {}", if idx == selected {"→"} else {" "}, action_label(*action));
-            ListItem::new(content)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::bordered().title("Choose an action"))
-        .highlight_symbol("");
-    f.render_widget(list, chunks[1]);
-
-    let footer = Paragraph::new("Use ↑/↓ to move, Enter to select, q to quit.")
-        .alignment(Alignment::Center)
-        .block(Block::bordered());
-    f.render_widget(footer, chunks[2]);
-}
-
-fn draw_action(f: &mut ratatui::Frame, view: &ActionView) {
-    use ratatui::layout::*;
-    use ratatui::style::*;
-    use ratatui::widgets::*;
-
-    let area = f.area();
-    let outer = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(7),
-        Constraint::Length(3),
-    ])
-    .split(area);
-
-    let header_text = format!(
-        "{}{}",
-        action_label(view.action),
-        if view.busy { " (running...)" } else { "" }
-    );
-    let header = Paragraph::new(header_text)
-        .alignment(Alignment::Center)
-        .block(Block::bordered().title("Action"));
-    f.render_widget(header, outer[0]);
-
-    let mid = Layout::horizontal([
-        Constraint::Percentage(55),
-        Constraint::Percentage(45),
-    ])
-    .split(outer[1]);
-
-    let show_candidates = !view.available.is_empty()
-        && matches!(view.action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt);
-
-    let left_chunks = if show_candidates {
-        Layout::vertical([
-            Constraint::Min(5),
-            Constraint::Length((view.available.len().saturating_mul(1) + 2) as u16),
-        ])
-        .split(mid[0])
-    } else {
-        Layout::vertical([Constraint::Min(5)]).split(mid[0])
-    };
-
-    let mut items = Vec::new();
-    for (idx, field) in view.fields.iter().enumerate() {
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![Span::styled(
-            format!("{}:", field.label),
-            Style::default().fg(Color::Cyan),
-        )]));
-        if field.value.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "<empty>",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for val_line in field.value.lines() {
-                lines.push(Line::from(val_line.to_string()));
-            }
-        }
-
-        let mut item = ListItem::new(lines);
-        if view.focus == Focus::Fields && idx == view.selected {
-            let style = if view.editing {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::LightGreen)
-            };
-            item = item.style(style);
-        }
-        items.push(item);
-    }
-
-    let list = List::new(items)
-        .block(Block::bordered().title("Fields"))
-        .highlight_symbol("");
-    f.render_widget(list, left_chunks[0]);
-
-    if show_candidates {
-        let mut list_items = Vec::new();
-        for (idx, path) in view.available.iter().enumerate() {
-            let prefix = if view.focus == Focus::Candidates && view.candidate_idx == idx {
-                "→ "
-            } else {
-                "  "
-            };
-            list_items.push(ListItem::new(format!("{}{}", prefix, path)));
-        }
-        let list = List::new(list_items)
-            .block(Block::bordered().title("Files"))
-            .highlight_symbol("");
-        f.render_widget(list, left_chunks[1]);
-    }
-
-    if let Some(progress) = &view.pad_progress {
-        let gauge_area = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(3),
-        ])
-        .split(mid[1]);
-        let gauge = Gauge::default()
-            .block(Block::bordered().title("Pad generation"))
-            .ratio(progress.ratio())
-            .label(format!("{}/{} bytes", progress.done, progress.target_len));
-        f.render_widget(gauge, gauge_area[0]);
-
-        let preview = Paragraph::new(progress.glyph_preview())
-            .block(Block::bordered().title("Recent glyph stream"));
-        f.render_widget(preview, gauge_area[1]);
-    } else {
-        let show_extra = matches!(view.action, WizardAction::QuickDecrypt | WizardAction::PadDecrypt);
-        let has_output = view.output_panel.is_some();
-
-        let mut vertical = Vec::new();
-        if has_output {
-            vertical.push(Constraint::Length(9));
-        }
-        if show_extra {
-            vertical.push(Constraint::Length(7));
-        }
-        vertical.push(Constraint::Min(5));
-
-        let cols = Layout::vertical(vertical).split(mid[1]);
-        let mut col_idx = 0;
-
-        if let Some((title, content)) = &view.output_panel {
-            let output = Paragraph::new(content.clone())
-                .block(Block::bordered().title(title.as_str()))
-                .wrap(Wrap { trim: false });
-            f.render_widget(output, cols[col_idx]);
-            col_idx += 1;
-        }
-
-        if show_extra {
-            let frames = ["⏳", "✦", "✸", "✧", "✺", "✹"];
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0));
-            let idx = ((now.as_millis() / 150) as usize) % frames.len();
-            let glyph_seed = (now.subsec_nanos() as u64).to_le_bytes();
-            let mut preview = String::new();
-            for b in glyph_seed {
-                preview.push(glyph_from_byte(b));
-            }
-            let extra = Paragraph::new(format!(
-                "Decrypt lounge {}\nGlyph drift: {}",
-                frames[idx], preview
-            ))
-            .block(Block::bordered().title("Decryption vibes"));
-            f.render_widget(extra, cols[col_idx]);
-            col_idx += 1;
-        }
-
-        let status_text: String = if view.status.is_empty() {
-            "Status messages will appear here.".to_string()
-        } else {
-            view.status.join("\n")
-        };
-        let status = Paragraph::new(status_text)
-            .block(Block::bordered().title("Status"))
-            .wrap(Wrap { trim: true });
-        f.render_widget(status, cols[col_idx]);
-    }
-
-    let instructions = if view.editing {
-        "Esc: stop editing | Backspace: delete | Enter: newline (multiline) / finish edit (single) | Tab/Shift+Tab: move"
-    } else if matches!(view.action, WizardAction::QuickEncrypt | WizardAction::PadEncrypt)
-        && !view.available.is_empty()
-    {
-        "Enter: run | e: edit | Tab/Shift+Tab or ↑/↓: move | ↓ from last field to files, ↑ from files to fields | Enter on file: fill"
-    } else {
-        "Enter: run action | e: edit field | Tab/Shift+Tab or ↑/↓: move | Esc: back to menu"
-    };
-    let footer = Paragraph::new(instructions)
-        .alignment(Alignment::Center)
-        .block(Block::bordered());
-    f.render_widget(footer, outer[2]);
-}
-
-fn handle_char_input(field: &mut InputField, key: KeyCode, modifiers: KeyModifiers) {
-    match key {
-        KeyCode::Char(c) => {
-            if modifiers.contains(KeyModifiers::CONTROL) {
-                return;
-            }
-            field.value.push(c);
-        }
-        KeyCode::Backspace => {
-            field.value.pop();
-        }
-        KeyCode::Enter => {
-            if field.multiline {
-                field.value.push('\n');
-            }
-        }
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {}
-        _ => {}
-    }
 }
 
 fn run_action_now(view: &mut ActionView) {
     if view.busy {
         return;
     }
+    view.status.clear();
+    view.output_panel = None;
+    view.output_scroll = 0;
+    view.status_kind = StatusKind::Error;
+
+    let pad_path = if uses_shared_pad(view.action) {
+        let path = view.fields.last().unwrap().value.trim().to_string();
+        if path.is_empty() {
+            push_status(view, "Choose the shared pad file first.");
+            return;
+        }
+        path
+    } else {
+        String::new()
+    };
+    let pad = pad_path.as_str();
 
     match view.action {
         WizardAction::GeneratePad => {
             let length_str = view.fields[0].value.trim();
-            let target_len = if length_str.is_empty() {
-                1_048_576usize
-            } else {
-                match length_str.parse::<usize>() {
-                    Ok(v) if v > 0 => v,
-                    _ => {
-                        push_status(view, "Please enter a positive number for pad length.");
-                        return;
-                    }
+            let target_len = match parse_pad_size(length_str) {
+                Ok(v) => v,
+                Err(err) => {
+                    push_status(view, err.to_string());
+                    return;
                 }
             };
+            let path = view.fields[1].value.trim().to_string();
+            if path.is_empty() {
+                push_status(view, "Provide a new pad path.");
+                return;
+            }
 
-            match PadProgress::new(target_len) {
+            match PadProgress::new(target_len, &path) {
                 Ok(progress) => {
+                    view.status_kind = StatusKind::Running;
                     view.pad_progress = Some(progress);
                     view.busy = true;
-                    push_status(view, format!("Generating {} bytes to {}", target_len, DEFAULT_PAD_PATH));
+                    push_status(view, format!("Creating {} at {path}", format_bytes(target_len)));
                 }
                 Err(err) => push_status(view, format!("Unable to start generation: {err}")),
             }
@@ -1149,6 +893,7 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = true;
             match encrypt_file(file, &mut OsRng) {
                 Ok(result) => {
+                    view.status_kind = StatusKind::Success;
                     push_status(view, format!("Encrypted file: {}", result.output_path.display()));
                     push_status(view, format!("Pad key: {}", result.pad_path.display()));
                 }
@@ -1175,13 +920,15 @@ fn run_action_now(view: &mut ActionView) {
             }
             view.busy = true;
             match decrypt_file(&enc, &key) {
-                Ok(path) => push_status(view, format!("Decrypted to {}", path.display())),
+                Ok(path) => {
+                    view.status_kind = StatusKind::Success;
+                    push_status(view, format!("Decrypted to {}", path.display()));
+                }
                 Err(err) => push_status(view, format!("Decryption failed: {err}")),
             }
             view.busy = false;
         }
         WizardAction::PadEncrypt => {
-            let pad = DEFAULT_PAD_PATH;
             let file = view.fields[0].value.trim();
             if file.is_empty() {
                 push_status(view, "Provide a file path.");
@@ -1190,6 +937,7 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = true;
             match pad_encrypt(file, pad) {
                 Ok(result) => {
+                    view.status_kind = StatusKind::Success;
                     push_status(view, format!("Encrypted file: {}", result.output_path.display()));
                     push_status(view, format!(
                         "Pad bytes used: {}-{} (end exclusive)",
@@ -1201,7 +949,6 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = false;
         }
         WizardAction::PadDecrypt => {
-            let pad = DEFAULT_PAD_PATH;
             let enc = view.fields[0].value.trim();
             if enc.is_empty() {
                 push_status(view, "Provide the encrypted file path.");
@@ -1209,13 +956,15 @@ fn run_action_now(view: &mut ActionView) {
             }
             view.busy = true;
             match pad_decrypt(enc, pad) {
-                Ok(result) => push_status(view, format!("Decrypted to {}", result.output_path.display())),
+                Ok(result) => {
+                    view.status_kind = StatusKind::Success;
+                    push_status(view, format!("Decrypted to {}", result.output_path.display()));
+                }
                 Err(err) => push_status(view, format!("Pad decryption failed: {err}")),
             }
             view.busy = false;
         }
         WizardAction::PadMessageEncrypt => {
-            let pad = DEFAULT_PAD_PATH;
             let msg = &view.fields[0].value;
             if msg.trim().is_empty() {
                 push_status(view, "Provide a message to encrypt.");
@@ -1224,8 +973,9 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = true;
             match pad_message_encrypt(pad, msg) {
                 Ok((cipher, start, end)) => {
+                    view.status_kind = StatusKind::Success;
                     push_status(view, format!("Pad bytes used: {}-{}", start, end));
-                    push_status(view, "Encrypted message shown on the right.");
+                    push_status(view, "Encrypted message is in the results panel. PgUp/PgDn to scroll.");
                     view.output_panel = Some(("Encrypted message".to_string(), cipher.clone()));
                     append_message_pad("ENCRYPTED", &cipher);
                     push_status(view, format!("Saved to {MESSAGE_PAD_PATH}"));
@@ -1235,7 +985,6 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = false;
         }
         WizardAction::PadMessageDecrypt => {
-            let pad = DEFAULT_PAD_PATH;
             let msg = &view.fields[0].value;
             if msg.trim().is_empty() {
                 push_status(view, "Provide the glyph message.");
@@ -1244,25 +993,26 @@ fn run_action_now(view: &mut ActionView) {
             view.busy = true;
             match pad_message_decrypt(pad, msg) {
                 Ok((plain, start, end)) => {
+                    view.status_kind = StatusKind::Success;
                     push_status(view, format!("Pad bytes consumed: {}-{}", start, end));
-                    push_status(view, "Decrypted message shown on the right.");
+                    push_status(view, "Decrypted message is in the results panel. PgUp/PgDn to scroll.");
                     view.output_panel = Some(("Decrypted message".to_string(), plain.clone()));
-                    append_message_pad("DECRYPTED", &plain);
-                    push_status(view, format!("Saved to {MESSAGE_PAD_PATH}"));
+                    push_status(view, "Plaintext has NOT been saved to disk.");
                 }
                 Err(err) => push_status(view, format!("Message decryption failed: {err}")),
             }
             view.busy = false;
         }
         WizardAction::PadBalance => {
-            let pad = DEFAULT_PAD_PATH;
             view.busy = true;
             match pad_balance(pad) {
                 Ok((used, total)) => {
+                    view.status_kind = StatusKind::Success;
                     let remaining = total.saturating_sub(used);
-                    push_status(view, format!("Pad total: {} bytes", total));
-                    push_status(view, format!("Used: {} bytes", used));
-                    push_status(view, format!("Remaining: {} bytes", remaining));
+                    push_status(view, format!("Pad: {pad}"));
+                    push_status(view, format!("Total: {}", format_bytes(total)));
+                    push_status(view, format!("Used: {}", format_bytes(used)));
+                    push_status(view, format!("Remaining: {}", format_bytes(remaining)));
                 }
                 Err(err) => push_status(view, format!("Unable to read pad balance: {err}")),
             }
@@ -1273,30 +1023,40 @@ fn run_action_now(view: &mut ActionView) {
 }
 
 fn run_wizard() -> io::Result<()> {
+    let result = run_wizard_inner();
+    let _ = crossterm::execute!(io::stdout(), event::DisableMouseCapture, event::DisableBracketedPaste);
+    ratatui::restore();
+    result
+}
+
+fn run_wizard_inner() -> io::Result<()> {
     use ratatui::Terminal;
 
     let mut terminal: Terminal<_> = ratatui::init();
+    crossterm::execute!(io::stdout(), event::EnableMouseCapture, event::EnableBracketedPaste)?;
     let mut app = App {
         screen: Screen::Menu { selected: 0 },
-        last_tick: Instant::now(),
     };
 
-    let tick_rate = Duration::from_millis(30);
-
     loop {
-        terminal.draw(|f| match &app.screen {
-            Screen::Menu { selected } => draw_menu(f, *selected),
-            Screen::Action(view) => draw_action(f, view),
+        let mut area = ratatui::layout::Rect::default();
+        terminal.draw(|f| {
+            area = f.area();
+            match &app.screen {
+                Screen::Menu { selected } => draw_menu(f, *selected),
+                Screen::Action(view) => draw_action(f, view),
+            }
         })?;
 
         if let Screen::Action(view) = &mut app.screen {
             let mut fail_message: Option<String> = None;
-            let mut complete: Option<usize> = None;
+            let mut complete: Option<(usize, String)> = None;
             let mut clear_progress = false;
 
             if let Some(progress) = &mut view.pad_progress {
                 if progress.error.is_none() && !progress.finished {
                     if let Err(err) = progress.step() {
+                        view.status_kind = StatusKind::Error;
                         progress.error = Some(err.to_string());
                         fail_message = Some(err.to_string());
                         view.busy = false;
@@ -1304,7 +1064,7 @@ fn run_wizard() -> io::Result<()> {
                     }
                 }
                 if progress.finished {
-                    complete = Some(progress.done);
+                    complete = Some((progress.done, progress.path.clone()));
                     clear_progress = true;
                 }
             }
@@ -1313,26 +1073,53 @@ fn run_wizard() -> io::Result<()> {
                 view.pad_progress = None;
             }
 
-            if let Some(done) = complete {
+            if let Some((done, path)) = complete {
+                view.status_kind = StatusKind::Success;
                 view.busy = false;
-                push_status(view, format!("Generated {} bytes to {}", done, DEFAULT_PAD_PATH));
+                push_status(view, format!("Created {} at {path}. Share securely; never reuse bytes.", format_bytes(done)));
             }
             if let Some(err) = fail_message {
                 push_status(view, format!("Generation failed: {}", err));
             }
         }
 
-        let timeout = tick_rate.saturating_sub(app.last_tick.elapsed());
+        let timeout = if matches!(&app.screen, Screen::Action(view) if view.busy) {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        };
         if event::poll(timeout)? {
-            app.last_tick = Instant::now();
-            if let Event::Key(key) = event::read()? {
+            let mut input = event::read()?;
+            if let Screen::Action(view) = &mut app.screen {
+                if handle_action_event(view, &input, area) {
+                    let selected = WIZARD_ACTIONS.iter().position(|a| *a == view.action).unwrap_or(0);
+                    app.screen = Screen::Menu { selected };
+                }
+                continue;
+            }
+            if let (Screen::Menu { selected }, Event::Mouse(mouse)) = (&mut app.screen, &input) {
+                let list = interface::menu_layout(area)[1];
+                let inside = list.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+                if mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
+                    && inside.contains((mouse.column, mouse.row).into()) {
+                    let index = interface::menu_offset(*selected, list) + (mouse.row - inside.y) as usize;
+                    if index < WIZARD_ACTIONS.len() {
+                        *selected = index;
+                        input = Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
+                } else if mouse.kind == event::MouseEventKind::ScrollDown {
+                    *selected = (*selected + 1).min(WIZARD_ACTIONS.len() - 1);
+                } else if mouse.kind == event::MouseEventKind::ScrollUp {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            if let Event::Key(key) = input {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 match &mut app.screen {
                     Screen::Menu { selected } => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            ratatui::restore();
                             return Ok(());
                         }
                         KeyCode::Up => {
@@ -1341,163 +1128,25 @@ fn run_wizard() -> io::Result<()> {
                             }
                         }
                         KeyCode::Down => {
-                            if *selected < 8 {
+                            if *selected + 1 < WIZARD_ACTIONS.len() {
                                 *selected += 1;
                             }
                         }
                         KeyCode::Enter => {
-                            let actions = [
-                                WizardAction::GeneratePad,
-                                WizardAction::QuickEncrypt,
-                                WizardAction::QuickDecrypt,
-                                WizardAction::PadEncrypt,
-                                WizardAction::PadDecrypt,
-                                WizardAction::PadMessageEncrypt,
-                                WizardAction::PadMessageDecrypt,
-                                WizardAction::PadBalance,
-                                WizardAction::Quit,
-                            ];
-                            let chosen = actions[*selected];
+                            let chosen = WIZARD_ACTIONS[*selected];
                             if chosen == WizardAction::Quit {
-                                ratatui::restore();
                                 return Ok(());
                             }
                             match build_action_view(chosen) {
                                 Ok(view) => app.screen = Screen::Action(view),
                                 Err(err) => {
-                                    ratatui::restore();
                                     return Err(err);
                                 }
                             }
                         }
                         _ => {}
                     },
-                    Screen::Action(view) => {
-                        let show_candidates = !view.available.is_empty()
-                            && !matches!(view.action, WizardAction::QuickDecrypt | WizardAction::PadDecrypt);
-
-                        if let Some(progress) = &view.pad_progress {
-                            if !progress.finished {
-                                if key.code == KeyCode::Esc {
-                                    app.screen = Screen::Menu { selected: 0 };
-                                }
-                                continue;
-                            }
-                        }
-
-                        if view.busy && view.pad_progress.is_none() {
-                            if key.code == KeyCode::Esc {
-                                app.screen = Screen::Menu { selected: 0 };
-                            }
-                            continue;
-                        }
-
-                        if view.editing {
-                            match key.code {
-                                KeyCode::Esc => view.editing = false,
-                                KeyCode::Tab => {
-                                    view.selected = (view.selected + 1) % view.fields.len();
-                                }
-                                KeyCode::BackTab => {
-                                    if view.selected == 0 {
-                                        view.selected = view.fields.len() - 1;
-                                    } else {
-                                        view.selected -= 1;
-                                    }
-                                }
-                                KeyCode::Enter if !view.fields[view.selected].multiline => {
-                                    view.editing = false;
-                                }
-                                _ => {
-                                    let field = &mut view.fields[view.selected];
-                                    handle_char_input(field, key.code, key.modifiers);
-                                }
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Esc => app.screen = Screen::Menu { selected: 0 },
-                                KeyCode::Char('e') => view.editing = true,
-                                KeyCode::Tab => {
-                                    if !view.fields.is_empty() {
-                                        view.focus = Focus::Fields;
-                                        view.selected = (view.selected + 1) % view.fields.len();
-                                    }
-                                }
-                                KeyCode::BackTab => {
-                                    if !view.fields.is_empty() {
-                                        view.focus = Focus::Fields;
-                                        if view.selected == 0 {
-                                            view.selected = view.fields.len() - 1;
-                                        } else {
-                                            view.selected -= 1;
-                                        }
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    if show_candidates {
-                                        view.focus = Focus::Candidates;
-                                        if view.candidate_idx >= view.available.len() {
-                                            view.candidate_idx = 0;
-                                        }
-                                    }
-                                }
-                                KeyCode::Left => {
-                                    view.focus = Focus::Fields;
-                                }
-                                KeyCode::Up => {
-                                    if view.focus == Focus::Candidates && show_candidates {
-                                        if view.candidate_idx == 0 {
-                                            view.candidate_idx = view.available.len() - 1;
-                                        }
-                                        view.focus = Focus::Fields;
-                                        if !view.fields.is_empty() {
-                                            view.selected = view.fields.len().saturating_sub(1);
-                                        }
-                                    } else if !view.fields.is_empty() {
-                                        if view.selected == 0 {
-                                            view.selected = view.fields.len() - 1;
-                                        } else {
-                                            view.selected -= 1;
-                                        }
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if view.focus == Focus::Candidates && show_candidates {
-                                        view.candidate_idx = (view.candidate_idx + 1) % view.available.len();
-                                    } else if show_candidates && !view.fields.is_empty() && view.selected == view.fields.len() - 1 {
-                                        view.focus = Focus::Candidates;
-                                        if view.candidate_idx >= view.available.len() {
-                                            view.candidate_idx = 0;
-                                        }
-                                    } else if !view.fields.is_empty() {
-                                        view.selected = (view.selected + 1) % view.fields.len();
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    if view.focus == Focus::Candidates && show_candidates {
-                                        let choice = view.available[view.candidate_idx].clone();
-                                        match view.action {
-                                            WizardAction::QuickEncrypt => {
-                                                view.fields[0].value = choice;
-                                            }
-                                            WizardAction::PadEncrypt => {
-                                                if !view.fields.is_empty() {
-                                                    view.fields[0].value = choice;
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                        view.focus = Focus::Fields;
-                                        view.selected = 0;
-                                        view.editing = false;
-                                    } else {
-                                        run_action_now(view);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    Screen::Action(_) => {}
                 }
             }
         }
@@ -1511,15 +1160,16 @@ fn main() {
         run_wizard()
     } else {
         let mut pad_length: Option<usize> = None;
+        let mut pad_path = DEFAULT_PAD_PATH.to_string();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-length" | "--length" => {
                     if let Some(val) = args.next() {
-                        match val.parse::<usize>() {
+                        match parse_pad_size(&val) {
                             Ok(v) => pad_length = Some(v),
-                            Err(_) => {
-                                eprintln!("Invalid length: {val}");
+                            Err(err) => {
+                                eprintln!("{err}");
                                 std::process::exit(1);
                             }
                         }
@@ -1527,6 +1177,12 @@ fn main() {
                         eprintln!("Missing value for -length");
                         std::process::exit(1);
                     }
+                }
+                "--pad" => {
+                    pad_path = args.next().filter(|path| !path.trim().is_empty()).unwrap_or_else(|| {
+                        eprintln!("Missing path for --pad");
+                        std::process::exit(1);
+                    });
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -1540,10 +1196,174 @@ fn main() {
             }
         }
 
-        run_animation(OsRng, pad_length)
+        match pad_length {
+            Some(length) => generate_pad_headless(OsRng, length, &pad_path),
+            None => Err(io::Error::new(io::ErrorKind::InvalidInput, "Specify --length when generating a pad outside the wizard")),
+        }
     };
 
     if let Err(err) = result {
-        eprintln!("Bytefall error: {err}");
+        eprintln!("Hieroglyph error: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub(super) fn new() -> Self {
+            let path = env::temp_dir().join(format!("hieroglyph-ux-{}-{}", std::process::id(), OsRng.next_u64()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        pub(super) fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn readable_pad_sizes_and_limits() {
+        for (input, size) in [("1", 1), (" 32 B ", 32), ("64KiB", 65536), ("10 mib", 10485760), ("1 GiB", 1073741824)] {
+            assert_eq!(parse_pad_size(input).unwrap(), size);
+        }
+        for input in ["", "0", "-1", "1.5 MiB", "10 MB", "1e3", "1 KiB extra", "💡", "184467440737095516160", "18446744073709551615 GiB"] {
+            assert!(parse_pad_size(input).is_err(), "{input}");
+        }
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB (1024 bytes)");
+    }
+
+    #[test]
+    fn new_pad_never_replaces_existing_pad_or_orphaned_index() {
+        let dir = TestDir::new();
+        let path = dir.path("outgoing.pad");
+        generate_pad_headless(OsRng, 128, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(original.len(), 128);
+        assert_eq!(PadWriter::new(&path).err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let other = dir.path("old.pad");
+        let idx = read_pad_index_path(Path::new(&other));
+        std::fs::write(&idx, b"64").unwrap();
+        assert!(PadWriter::new(&other).is_err());
+        assert!(!Path::new(&other).exists());
+        assert_eq!(std::fs::read(idx).unwrap(), b"64");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn generation_progress_uses_selected_path() {
+        let dir = TestDir::new();
+        let path = dir.path("incoming.pad");
+        let mut progress = PadProgress::new(5000, &path).unwrap();
+        while !progress.finished {
+            progress.step().unwrap();
+        }
+        assert_eq!(progress.ratio(), 1.0);
+        assert_eq!(progress.path, path);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn message_budget_counts_utf8_and_preserves_index_on_exhaustion() {
+        let dir = TestDir::new();
+        let pad = dir.path("message.pad");
+        generate_pad_headless(OsRng, 4, &pad).unwrap();
+        let (encrypted, start, end) = pad_message_encrypt(&pad, "é").unwrap();
+        assert_eq!((start, end), (0, 2));
+        assert_eq!(pad_message_decrypt(&pad, &encrypted).unwrap().0, "é");
+        let error = pad_message_encrypt(&pad, "abc").unwrap_err().to_string();
+        assert!(error.contains("need 3, have 2"));
+        assert_eq!(pad_balance(&pad).unwrap(), (2, 4));
+        assert!(checked_pad_end(&pad, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn file_budget_includes_hash_bytes_and_legacy_round_trip_works() {
+        let dir = TestDir::new();
+        let pad = dir.path("file.pad");
+        let input = dir.path("message.txt");
+        generate_pad_headless(OsRng, 35, &pad).unwrap();
+        std::fs::write(&input, b"abc").unwrap();
+        let encrypted = pad_encrypt(&input, &pad).unwrap();
+        assert_eq!((encrypted.start, encrypted.end), (0, 35));
+        let decrypted = pad_decrypt(encrypted.output_path.to_str().unwrap(), &pad).unwrap();
+        assert_eq!(std::fs::read(decrypted.output_path).unwrap(), b"abc");
+        let error = pad_encrypt(&input, &pad).err().unwrap().to_string();
+        assert!(error.contains("need 35, have 0"));
+        assert_eq!(pad_balance(&pad).unwrap(), (35, 35));
+    }
+
+    #[test]
+    fn shared_pad_actions_offer_an_editable_pad_path() {
+        for action in WIZARD_ACTIONS.iter().copied().filter(|a| uses_shared_pad(*a)) {
+            let view = build_action_view(action).unwrap();
+            assert_eq!(view.fields.last().unwrap().value, DEFAULT_PAD_PATH);
+            assert_eq!(view.focus, Focus::Fields);
+        }
+        let mut field = InputField::new("Path", "old.pad".into(), false);
+        interface::handle_char_input(&mut field, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(field.value.is_empty());
+    }
+
+    #[test]
+    fn balance_action_reads_selected_pad() {
+        let dir = TestDir::new();
+        let path = dir.path("chosen.pad");
+        generate_pad_headless(OsRng, 1024, &path).unwrap();
+        let mut view = build_action_view(WizardAction::PadBalance).unwrap();
+        view.fields[0].value = path.clone();
+        run_action_now(&mut view);
+        assert!(view.status.iter().any(|s| s == &format!("Pad: {path}")));
+        assert!(view.status.iter().any(|s| s == "Remaining: 1.0 KiB (1024 bytes)"));
+    }
+
+    #[test]
+    fn decrypted_message_action_uses_selected_pad_and_displays_plaintext() {
+        let dir = TestDir::new();
+        let path = dir.path("chosen.pad");
+        generate_pad_headless(OsRng, 128, &path).unwrap();
+        let (encrypted, _, _) = pad_message_encrypt(&path, "private message").unwrap();
+        let mut view = build_action_view(WizardAction::PadMessageDecrypt).unwrap();
+        view.fields[0].value = encrypted;
+        view.fields[1].value = path;
+        run_action_now(&mut view);
+        assert_eq!(view.output_panel.unwrap().1, "private message");
+        assert!(view.status.iter().any(|s| s.contains("NOT been saved")));
+        assert!(!view.status.iter().any(|s| s.contains(MESSAGE_PAD_PATH)));
+    }
+
+    #[test]
+    fn menus_scroll_to_every_action_and_show_help() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (width, height) in [(100, 30), (55, 16), (20, 6)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for (selected, action) in WIZARD_ACTIONS.iter().enumerate() {
+                terminal.draw(|frame| draw_menu(frame, selected)).unwrap();
+                let view = build_action_view(*action).unwrap();
+                terminal.draw(|frame| draw_action(frame, &view)).unwrap();
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw_menu(frame, WIZARD_ACTIONS.len() - 1)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Quit"));
+        assert!(text.contains("How it works"));
+        assert!(!text.contains("Glyph drift"));
     }
 }
